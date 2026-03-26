@@ -76,7 +76,7 @@ If vLLM breaks after upgrade, it's OK -- baselines are already computed, and tra
 
 ---
 
-## Milestone 1: Core Utilities (tokens, boundary, data, config)
+## Milestone 1: Core Utilities (tokens, boundary, data, config) DONE
 
 ### `src/config.py`
 Central `BackoffConfig` dataclass. All hyperparameters:
@@ -108,7 +108,7 @@ Adapt from Ivan's `marie/ivan:src/data/gsm8k.py`:
 
 ---
 
-## Milestone 2: Backoff-Aware Generation Loop DONE
+## Milestone 2: Backoff-Aware Generation Loop 
 
 **File**: `src/generation.py`
 
