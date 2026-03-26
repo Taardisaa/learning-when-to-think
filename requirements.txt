@@ -1,3 +1,4 @@
+accelerate==1.13.0
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.3
 aiosignal==1.4.0
@@ -50,7 +51,7 @@ httpcore==1.0.9
 httptools==0.7.1
 httpx==0.28.1
 httpx-sse==0.4.3
-huggingface_hub==0.36.2
+huggingface_hub==1.8.0
 idna==3.11
 ijson==3.5.0
 importlib_metadata==8.7.1
@@ -129,6 +130,7 @@ outlines_core==0.2.11
 packaging==26.0
 pandas==3.0.1
 partial-json-parser==0.2.1.1.post7
+peft==0.18.1
 pillow==12.1.1
 prometheus-fastapi-instrumentator==7.1.0
 prometheus_client==0.24.1
@@ -181,15 +183,15 @@ torch_c_dlpack_ext==0.1.5
 torchaudio==2.10.0
 torchvision==0.25.0
 tqdm==4.67.3
-transformers==4.57.6
+transformers==5.3.0
 triton==3.6.0
+trl==0.29.1
 typer==0.24.1
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 urllib3==2.6.3
 uvicorn==0.42.0
 uvloop==0.22.1
-vllm==0.18.0
 watchfiles==1.1.1
 websockets==16.0
 xgrammar==0.1.32
