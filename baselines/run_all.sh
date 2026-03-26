@@ -1,0 +1,1 @@
+python eval_gsm8k.py --model Qwen/Qwen3.5-2B Qwen/Qwen3.5-4B Qwen/Qwen3.5-9B --max-samples 500
