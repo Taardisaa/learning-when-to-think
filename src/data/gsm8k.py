@@ -47,7 +47,18 @@ def extract_predicted_number(text: str) -> str | None:
     # Strict: \boxed{N} format (last match)
     matches = re.findall(r"\\boxed\{([^}]+)\}", text)
     if matches:
-        return matches[-1].replace(",", "").replace("$", "").strip()
+        raw = matches[-1]
+        # Strip LaTeX currency/formatting: \$, \, \text{...}, commas
+        raw = raw.replace("\\$", "").replace("$", "").replace(",", "")
+        raw = re.sub(r"\\text\{[^}]*\}", "", raw)
+        raw = re.sub(r"\\[a-zA-Z]+", "", raw)  # strip \dfrac, \frac, etc.
+        raw = re.sub(r"[{}]", "", raw)  # leftover braces
+        raw = raw.strip()
+        # Extract the first number from whatever remains
+        num = re.search(r"-?\d+\.?\d*", raw)
+        if num:
+            return num.group()
+        return raw if raw else None
 
     # Legacy: #### N format (last match)
     matches = re.findall(r"####\s*\$?(-?[\d,.]+)", text)

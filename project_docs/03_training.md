@@ -162,3 +162,39 @@ $$\mathrm{KL}_{\text{het}}(\pi_\theta \| \pi_{\text{ref}}) = \beta_{\text{reason
 **Justification:** Action tokens ($\langle\texttt{backoff}\rangle$, $\langle\texttt{continue}\rangle$, $\langle\texttt{terminate}\rangle$) don't exist in the pretrained model — they're new tokens with randomly initialized embeddings. The pretrained reference policy $\pi_{\text{ref}}$ assigns near-uniform probability to them. A standard KL penalty therefore penalizes ANY non-uniform action distribution, even a clearly useful one (like "always continue on easy problems, backoff on hard ones"). Using a lower $\beta_{\text{action}}$ lets the model develop strong action preferences without being pulled back to the meaningless reference distribution.
 
 But again — only propose this if vanilla GRPO shows the problem.
+
+---
+
+## SFT Data: Lessons Learned
+
+### Synthetic perturbation doesn't work
+
+The original approach (`scripts/generate_sft_from_rollouts.py`) perturbed numbers in correct rollouts to create "wrong" steps. Problems:
+- The "errors" are artificial — swapping `200` to `214` in otherwise correct reasoning
+- The model never sees its own real failure patterns
+- Directives reference specific wrong/correct numbers but the surrounding reasoning is coherent, making the backoff feel arbitrary
+
+### Real wrong rollouts (S²R-style) are better
+
+`scripts/generate_sft_real_backoff.py` uses the model's own incorrect rollouts stitched with correct ones:
+- Wrong reasoning reflects genuine failure modes (misinterpretation, wrong approach, arithmetic confusion)
+- Directives must be **locally meaningful** — referencing what's visible at the splice point, not the final wrong answer
+- No clean/synthetic examples needed — the model already knows how to reason correctly; SFT Phase 1 only needs to teach the backoff format
+
+### Dataset difficulty matters
+
+| Dataset | 1.7B pass rate (temp=0.6, K=8) | Usable problems | Verdict |
+|---------|-------------------------------|-----------------|---------|
+| GSM8K | ~93% | ~15% (most problems all-correct) | Too easy |
+| MATH | Expected ~30-50% | ~60-80% (much more wrong rollouts) | Better fit |
+
+GSM8K yields only ~350 real backoff examples from 7.5k problems. MATH should yield 3-5x more usable examples due to higher failure rate.
+
+### Grading pitfalls
+
+`extract_predicted_number()` must handle LaTeX formatting in `\boxed{}`:
+- `\boxed{\$840}` → strip `\$` → `840` (not `\840`)
+- `\boxed{\dfrac{8}{3}}` → extract first number → `8` (or handle fractions)
+- `\boxed{4,000,000}` vs gold `4` → units mismatch causes false negatives
+
+These grading errors create **poisoned training data** — examples where the "wrong" rollout was actually correct, teaching the model to backoff from correct reasoning. Fixed in `src/data/gsm8k.py`.

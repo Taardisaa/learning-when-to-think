@@ -335,54 +335,61 @@ This is a classic **exploration failure**. We solve it with a three-phase curric
 
 **Goal:** Teach the model what backoff *looks like* syntactically. Not when to use it optimally — just that it exists and how the token sequence works.
 
-**Synthetic data construction (automatic, no human labels):**
+**Data construction: real wrong rollouts (S²R-style, no synthetic perturbation).**
+
+Inspired by S²R (Ma et al., 2025), we construct SFT data from the model's **own** correct and incorrect rollouts, not synthetic number perturbations. Synthetic perturbation (swapping a number in correct reasoning) creates artificial errors that don't match real failure patterns, and the model never learns to recognize its actual mistakes.
 
 ```
-For each problem x in GSM8K train set:
-    1. Generate CoT solution with base model
-    2. Check correctness against gold answer
-    3. If WRONG:
-        a. Identify where reasoning diverged (heuristic or stronger model)
-        b. Construct training example:
-           [correct prefix] [wrong segment] <backoff> <depth> [directive] <continue> [corrected reasoning] <terminate>
-    4. If CORRECT:
-        a. Use as-is with <continue> tokens at boundaries and <terminate> at end
-        b. (Teaches the model that backoff is optional, not mandatory)
+Script: scripts/generate_sft_real_backoff.py
+
+For each problem x in the training set:
+    1. Sample K=8 rollouts from the base model (temp=0.6)
+    2. Grade each rollout against gold answer → correct/incorrect
+    3. Compute pass_rate = #correct / K
+    4. If pass_rate ∈ (0, 1) — problem has both correct and wrong rollouts:
+        a. Pick a wrong rollout (genuine failure) and a correct rollout (genuine success)
+        b. Stitch: [wrong reasoning] <backoff_3> [locally-meaningful directive] [correct reasoning] → \boxed{answer}
+    5. If pass_rate = 0 or 1 — skip (no usable contrast)
 ```
 
-**Example synthetic training instance:**
+**Critical design: locally-meaningful directives.** The directive after `<backoff_3>` must reference what's visible at the splice point, not the final wrong answer. The directive has two parts:
+1. What went wrong — references the error visible in the preceding text (e.g., "Interpreting 'two times more' as 3x is wrong")
+2. What to try — hints from the correct rollout's opening (e.g., "Juice = 2 × Sandwich = 2×4 = $8")
+
+**Example real-backoff training instance:**
 
 ```
-Q: Natalia sold clips to 48 friends in April, half as many in May. Total?
-
-Natalia sold 48 clips in April. <continue>
-Half of 48 is 12, so she sold 12 in May. <continue>
-So total is 48 + 12 = 60. <backoff> <2> that division is wrong, half of 48 is 24 <continue>
-Half of 48 is 24, so she sold 24 in May. <continue>
-Total is 48 + 24 = 72. <terminate>
-#### 72
+<think>
+[model's actual wrong reasoning on this problem, arriving at wrong intermediate results]
+...the total capacity is 2 beds × 2 students = 4, so 30/4 = 8 rooms.
+<backoff_3> That gives 8, which is wrong. The pull-out couch adds 1 more student per room: 2×2+1 = 5 per room.
+[model's actual correct reasoning on the same problem]
+...each room fits 2×2 + 1 = 5 students, so 30/5 = 6 rooms.
+</think>
+\boxed{6}
 ```
 
-**Data requirements:**
-- A few hundred to low thousands of examples (format learning, not domain mastery)
-- Mix of backoff examples (~40%) and clean forward-only examples (~60%) — the model must learn that backoff is conditional, not reflexive
-- Vary backoff depth ($\langle 1 \rangle$ through $\langle D_{\max} \rangle$) and directive styles
+**Dataset requirements:**
+- Needs a training set where the model has **non-trivial failure rate** (10-50% of problems have both correct and wrong rollouts)
+- **GSM8K is too easy** for Qwen3-1.7B (~93% pass rate at temp=0.6 → only 15% of problems are usable, yielding ~350 real backoff examples on the full 7.5k train set)
+- **MATH** (Hendrycks et al., 2021) is a better fit — competition-level problems where a 1.7B model will fail much more often, producing more wrong rollouts
+- All wrong reasoning is self-generated (on-policy) — no distribution shift (SCoRe's key finding)
 
 **SFT objective:** Standard next-token prediction cross-entropy loss on the full sequence, with LoRA:
 
 $$\mathcal{L}_{\text{SFT}}(\theta) = -\sum_{j} \log p_\theta(y_j \mid y_{<j})$$
 
 **What this teaches:**
-- The embedding space for $\langle\texttt{backoff}\rangle$, $\langle\texttt{continue}\rangle$, $\langle\texttt{terminate}\rangle$, and depth tokens gets meaningful initialization
-- The model learns the syntax: `<backoff> <depth> [directive] <continue>`
-- The model learns that backoff appears after wrong reasoning, not randomly
+- The embedding space for backoff tokens gets meaningful initialization
+- The model learns the syntax: `[wrong reasoning] <backoff_3> [directive] [correct reasoning]`
+- The model learns that backoff appears after its own real failure patterns, not after artificial noise
 
 **What this does NOT teach:**
 - Optimal backoff policy (when to backoff vs. continue)
 - Optimal directive content
 - Optimal rewind depth
 
-These are learned in Phase 2-3 via RL.
+These are learned in Phase 2 via RL.
 
 ---
 
