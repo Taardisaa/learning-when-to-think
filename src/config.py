@@ -40,12 +40,12 @@ class BackoffConfig:
     sft_grad_accum: int = 4
 
     # Generation
-    temperature: float = 0.7     # sampling temperature for rollouts
+    temperature: float = 0.6     # sampling temperature for rollouts (Qwen3 thinking)
     eval_temperature: float = 0.0  # greedy for eval
     repetition_penalty: float = 1.0  # 1.0 = disabled; baseline uses 1.3
 
     # System prompt used in chat template
     system_prompt: str = (
         "Solve the following math problem. "
-        "Give the final answer after ####."
+        r"Please reason step by step, and put your final answer within \boxed{}."
     )

@@ -57,7 +57,7 @@ Our method is Category 2 + $\langle\texttt{backoff}\rangle$. The key comparison 
 ## Constraints
 
 - 2 × A6000, 48 × 2 = 96 GB VRAM
-- Small models only (Qwen3.5 0.8B / 2B / 4B / 9B)
+- Small models only (Qwen3 0.6B / 1.7B / 4B / 8B)
 - LoRA + GRPO (no PPO, no value network)
 - Target venue: NeurIPS/ICLR/ICML
 
@@ -67,10 +67,12 @@ Baseline forward-only evaluations on GSM8K (500 samples, strict `####` extractio
 
 | Model | Accuracy | Extracted | Avg Tokens |
 |-------|----------|-----------|------------|
-| Qwen3.5-0.8B | 7.4% | 15.2% | 5732 |
-| Qwen3.5-2B | 31.6% | 38.2% | 4988 |
-| Qwen3.5-4B | 70.0% | 78.4% | 3140 |
-| Qwen3.5-9B | 88.2% | 93.8% | 3428 |
+| Qwen3.5-0.8B* | 7.4% | 15.2% | 5732 |
+| Qwen3.5-2B* | 31.6% | 38.2% | 4988 |
+| Qwen3.5-4B* | 70.0% | 78.4% | 3140 |
+| Qwen3.5-9B* | 88.2% | 93.8% | 3428 |
+
+*Baselines run on Qwen3.5 before migration to Qwen3. Will re-run on Qwen3 models.
 
 Next: complete baselines, then implement three-phase training (SFT warm-up → GRPO + exploration bonus → pure GRPO).
 

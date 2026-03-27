@@ -31,10 +31,10 @@ def extract_answer_number(text: str) -> str | None:
 
 
 def extract_predicted_number(text: str) -> str | None:
-    """Extract predicted answer from model output.
+    r"""Extract predicted answer from model output.
 
-    Looks after </think> (if present), only in the last 300 chars,
-    then tries strict #### format, falling back to last number.
+    Looks after </think> (if present), only in the last 300 chars.
+    Tries formats in order: \boxed{N}, #### N, then last number.
     """
     think_end = text.find("</think>")
     if think_end >= 0:
@@ -44,7 +44,12 @@ def extract_predicted_number(text: str) -> str | None:
     if len(text) > 300:
         text = text[-300:]
 
-    # Strict: #### N format (last match)
+    # Strict: \boxed{N} format (last match)
+    matches = re.findall(r"\\boxed\{([^}]+)\}", text)
+    if matches:
+        return matches[-1].replace(",", "").replace("$", "").strip()
+
+    # Legacy: #### N format (last match)
     matches = re.findall(r"####\s*\$?(-?[\d,.]+)", text)
     if matches:
         return matches[-1].replace(",", "").replace("$", "").strip()

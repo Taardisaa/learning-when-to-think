@@ -9,6 +9,8 @@ Usage:
 """
 
 import argparse
+import json
+from pathlib import Path
 
 import torch
 from peft import PeftModel
@@ -47,6 +49,8 @@ def main():
     parser.add_argument("--t-max", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--repetition-penalty", type=float, default=1.3)
+    parser.add_argument("--output", default=None,
+                        help="Output JSON path (default: auto-generated from model name)")
     args = parser.parse_args()
 
     use_raw = args.no_adapter or args.checkpoint is None
@@ -86,17 +90,30 @@ def main():
         )
         gen = BackoffGenerator(model, tokenizer, token_ids, config)
 
+    # Determine output path
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        if use_raw:
+            short_name = args.base_model.split("/")[-1]
+        else:
+            short_name = Path(args.checkpoint).name + "_sft"
+        output_path = Path("eval_results") / f"{short_name}_n{args.n}.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     data = load_gsm8k("test", subset_size=args.n)
 
     correct = 0
     total_backoffs = 0
     total_segments = 0
     total_terminates = 0
+    results = []
 
     for i, ex in enumerate(data):
         messages = [{"role": "user", "content": (
             f"Solve the following math problem. "
-            f"Give the final answer after ####.\n\n{ex['question']}"
+            f"Please reason step by step, and put your final answer "
+            f"within \\boxed{{}}.\n\n{ex['question']}"
         )}]
         try:
             prompt_text = tokenizer.apply_chat_template(
@@ -117,6 +134,15 @@ def main():
             if is_correct:
                 correct += 1
 
+            results.append({
+                "index": i,
+                "question": ex["question"],
+                "gold": ex["answer_number"],
+                "predicted": predicted,
+                "correct": is_correct,
+                "output": output_text,
+            })
+
             print(f"\n{'='*70}")
             print(f"Problem {i}: {ex['question']}...")
             print(f"Gold: {ex['answer_number']}  Predicted: {predicted}  "
@@ -135,6 +161,33 @@ def main():
             is_correct = traj.answer_number == ex["answer_number"]
             if is_correct:
                 correct += 1
+
+            # Build segment details for JSON
+            seg_details = []
+            for j, seg in enumerate(traj.segments):
+                sd = {
+                    "chunk_text": tokenizer.decode(seg.chunk_ids),
+                    "action": id2name.get(seg.action, str(seg.action)) if seg.action is not None else "boundary",
+                    "n_tokens": len(seg.chunk_ids),
+                }
+                if seg.directive_ids:
+                    sd["directive"] = tokenizer.decode(seg.directive_ids)
+                if seg.rewind_pos is not None:
+                    sd["rewind_pos"] = seg.rewind_pos
+                seg_details.append(sd)
+
+            results.append({
+                "index": i,
+                "question": ex["question"],
+                "gold": ex["answer_number"],
+                "predicted": traj.answer_number,
+                "correct": is_correct,
+                "answer_text": traj.answer_text,
+                "segments": seg_details,
+                "backoff_count": n_backoff,
+                "terminated": traj.terminated,
+                "gen_tokens": traj.total_generated_tokens,
+            })
 
             print(f"\n{'='*70}")
             print(f"Problem {i}: {ex['question']}...")
@@ -166,6 +219,24 @@ def main():
         print(f"Segments:     {total_segments} total ({total_segments/args.n:.1f}/problem)")
         print(f"<backoff>:    {total_backoffs} total ({total_backoffs/args.n:.1f}/problem)")
         print(f"Terminated:   {total_terminates}/{args.n}")
+
+    # Save results
+    summary = {
+        "model": args.base_model,
+        "checkpoint": args.checkpoint,
+        "mode": "raw" if use_raw else "backoff",
+        "n": args.n,
+        "accuracy": round(100 * correct / args.n, 2),
+        "correct": correct,
+    }
+    if not use_raw:
+        summary["total_segments"] = total_segments
+        summary["total_backoffs"] = total_backoffs
+        summary["terminated"] = total_terminates
+
+    output_data = {"summary": summary, "results": results}
+    output_path.write_text(json.dumps(output_data, indent=2, ensure_ascii=False))
+    print(f"\nResults saved to {output_path}")
 
 
 if __name__ == "__main__":

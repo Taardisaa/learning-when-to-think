@@ -34,7 +34,7 @@ def main():
     messages = [
         {"role": "user", "content": (
             f"Solve the following math problem. "
-            f"Give the final answer after ####.\n\n{question}"
+            f"Please reason step by step, and put your final answer within \\boxed{}.\n\n{question}"
         )}
     ]
     try:

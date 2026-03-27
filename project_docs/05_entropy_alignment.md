@@ -106,7 +106,7 @@ But instead of a fixed threshold $\tau$ and fixed $k$, both are **learned and co
 
 ## Mechanistic Inspection: Looking Inside the Model
 
-**Target model:** Qwen3.5-4B (~36 layers, ~2560 hidden dim, bf16 ≈ 8 GB). Comfortably fits on a single GPU for inference with forward hooks. All methods below require only inference — no additional training except the linear probe.
+**Target model:** Qwen3-4B (~36 layers, GQA with 32 query / 8 KV heads, bf16 ≈ 8 GB). Comfortably fits on a single GPU for inference with forward hooks. All methods below require only inference — no additional training except the linear probe.
 
 ### Inspection 1: Linear Probe on Residual Stream
 
@@ -232,4 +232,4 @@ Rank neurons by $|r_{l,i}|$. The top-$k$ are "backoff neurons."
 | **4** | Top backoff neurons (MLP correlation) | ~5k forward passes + correlation | What features drive backoff? Surface uncertainty vs deep logic? |
 | **5** | Activation patching | ~18k forward passes | Causal circuit: which layers/heads are necessary? |
 
-Priority 1 requires no new infrastructure — just logging in the existing generation loop. Priorities 2–4 need a simple hook-based script. Priority 5 is the most expensive but gives the strongest causal story. All are single-GPU feasible on Qwen3.5-4B.
+Priority 1 requires no new infrastructure — just logging in the existing generation loop. Priorities 2–4 need a simple hook-based script. Priority 5 is the most expensive but gives the strongest causal story. All are single-GPU feasible on Qwen3-4B.

@@ -208,13 +208,13 @@ def build_clean_example(
         ...
         [final step]
         </think>
-        #### [answer]
+        \\boxed{[answer]}
     """
     parts = ["<think>"]
     for step in steps:
         parts.append(step)
     parts.append("</think>")
-    parts.append(f"#### {answer}")
+    parts.append(f"\\boxed{{{answer}}}")
     return "\n".join(parts)
 
 
@@ -288,18 +288,19 @@ def build_backoff_example(
         parts.append(steps[i])
     parts.append("</think>")
 
-    parts.append(f"#### {answer}")
+    parts.append(f"\\boxed{{{answer}}}")
     return "\n".join(parts)
 
 
 def format_chat(question: str, assistant_content: str) -> list[dict]:
-    """Format as Qwen3 chat messages."""
+    r"""Format as Qwen3 chat messages."""
     return [
         {
             "role": "user",
             "content": (
                 "Solve the following math problem. "
-                "Give the final answer after ####.\n\n" + question
+                "Please reason step by step, and put your final answer "
+                "within \\boxed{}.\n\n" + question
             ),
         },
         {"role": "assistant", "content": assistant_content},

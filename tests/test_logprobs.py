@@ -31,7 +31,7 @@ def setup():
 
 
 def _make_prompt(tokenizer, question):
-    messages = [{"role": "user", "content": f"Solve the following math problem. Give the final answer after ####.\n\n{question}"}]
+    messages = [{"role": "user", "content": f"Solve the following math problem. Please reason step by step, and put your final answer within \\boxed{}.\n\n{question}"}]
     try:
         text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=True

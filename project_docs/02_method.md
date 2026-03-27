@@ -26,7 +26,7 @@ $$\mathcal{A} = \{\langle\texttt{continue}\rangle,\; \langle\texttt{backoff}\ran
 
 $$\mathcal{D} = \{\langle 1 \rangle,\; \langle 2 \rangle,\; \langle 3 \rangle\} \subset \mathcal{V} \quad (D_{\max} = 3)$$
 
-**$\langle\texttt{terminate}\rangle$ is just `</think>`.** CoT models like Qwen3.5 already have `</think>` in their vocabulary with a trained embedding — it already means "stop reasoning, output the answer." After `</think>`, the model naturally transitions to answer generation. We don't need to add a new token for this or "extract" anything; the model knows what to do.
+**$\langle\texttt{terminate}\rangle$ is just `</think>`.** CoT models like Qwen3 already have `</think>` in their vocabulary with a trained embedding — it already means "stop reasoning, output the answer." After `</think>`, the model naturally transitions to answer generation. We don't need to add a new token for this or "extract" anything; the model knows what to do.
 
 **$\langle\texttt{continue}\rangle$ is a no-op action.** Since we force a 3-way decision at every semantic boundary (via logits masking), we need a "keep going" option. Without it, the model would be forced to either backoff or terminate at every boundary. `<continue>` means "I checked and the current reasoning is fine, proceed to the next chunk." It enters the KV cache (costs 1 token per boundary — negligible) and keeps every decision point explicitly logged in the trajectory, which makes RL training and analysis cleaner.
 

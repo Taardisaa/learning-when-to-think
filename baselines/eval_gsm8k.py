@@ -25,13 +25,13 @@ from vllm import LLM, SamplingParams
 
 
 def extract_gsm8k_answer(text: str, method: str = "strict") -> str | None:
-    """Extract the final numerical answer from model output.
+    r"""Extract the final numerical answer from model output.
 
     Only looks at text AFTER </think>, and only the last 300 chars
     (following verl convention) to avoid matching thinking-trace numbers.
 
     Methods:
-        strict:   only #### N format (last match)
+        strict:   \boxed{N} or #### N format (last match)
         flexible: last number in the text
     """
     think_end = text.find("</think>")
@@ -43,6 +43,11 @@ def extract_gsm8k_answer(text: str, method: str = "strict") -> str | None:
         text = text[-300:]
 
     if method == "strict":
+        # \boxed{N} format (preferred for Qwen3)
+        matches = re.findall(r"\\boxed\{([^}]+)\}", text)
+        if matches:
+            return matches[-1].replace(",", "").replace("$", "").strip()
+        # Legacy #### N format
         matches = re.findall(r"####\s*\$?(-?[\d,.]+)", text)
         if not matches:
             return None
@@ -92,7 +97,8 @@ def evaluate_model(
         conversations.append([
             {"role": "user", "content": (
                 f"Solve the following math problem. "
-                f"Give the final answer after ####.\n\n{q}"
+                f"Please reason step by step, and put your final answer "
+                f"within \\boxed{{}}.\n\n{q}"
             )}
         ])
 
