@@ -12,7 +12,7 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.config import BackoffConfig
-from src.tokens import setup_tokenizer_and_model, TERMINATE_TOKEN, ACTION_TOKENS, DEPTH_TOKENS
+from src.tokens import setup_tokenizer_and_model, TERMINATE_TOKEN, ACTION_TOKENS, BACKOFF_TOKENS
 from src.generation import BackoffGenerator, TrajectoryRecord
 from src.train.logprobs import compute_trajectory_logprobs, compute_batch_logprobs, _build_passes
 
@@ -42,19 +42,17 @@ class ForcedActionGenerator(BackoffGenerator):
         self._forced = forced_actions or []
         self._idx = 0
 
-    def _sample_masked(self, logits, allowed_ids, temperature, generated_ids=None):
-        if set(allowed_ids).issubset(set(self.action_ids)):
+    def _sample(self, logits, temperature, generated_ids=None):
+        token_id, lp = super()._sample(logits, temperature, generated_ids)
+        # If the naturally sampled token is an action token, override it
+        if token_id in self.action_ids:
             if self._idx < len(self._forced):
                 forced = self._forced[self._idx]
                 self._idx += 1
-                if forced in allowed_ids:
-                    logits_flat = logits[0, -1, :]
-                    mask = torch.full_like(logits_flat, float("-inf"))
-                    mask[allowed_ids] = 0.0
-                    masked = logits_flat + mask
-                    lp = torch.nn.functional.log_softmax(masked, dim=-1)[forced].item()
-                    return forced, lp
-        return super()._sample_masked(logits, allowed_ids, temperature, generated_ids)
+                logits_flat = logits[0, -1, :]
+                log_probs = torch.nn.functional.log_softmax(logits_flat, dim=-1)
+                return forced, log_probs[forced].item()
+        return token_id, lp
 
 
 # --- Test 1: 0-backoff matches single forward pass ---
@@ -101,7 +99,7 @@ def test_one_backoff_has_two_passes(setup):
         model, tokenizer, token_ids, config,
         forced_actions=[
             token_ids["<continue>"],
-            token_ids["<backoff>"],
+            token_ids["<backoff_1>"],
             token_ids[TERMINATE_TOKEN],
         ],
     )
@@ -117,7 +115,7 @@ def test_one_backoff_has_two_passes(setup):
     # Pass 1 should end with last directive token (directive generated
     # before truncation, scored in pre-truncation context)
     seq1, start1, meta1 = passes[0]
-    backoff_seg = [s for s in traj.segments if s.depth is not None][0]
+    backoff_seg = [s for s in traj.segments if s.rewind_pos is not None][0]
     assert seq1[-1] == backoff_seg.directive_ids[-1]
 
     # Pass 2 prefix = surviving tokens + directive (re-injected)
@@ -187,7 +185,7 @@ def test_action_masking_respects_b_max(setup):
         model, tokenizer, token_ids, config,
         forced_actions=[
             token_ids["<continue>"],
-            token_ids["<backoff>"],  # uses up b_max=1
+            token_ids["<backoff_1>"],  # uses up b_max=1
             # Next action: <backoff> should be masked
         ],
     )
@@ -203,10 +201,10 @@ def test_action_masking_respects_b_max(setup):
         for key, val in meta2.items():
             if isinstance(key, str) and key.startswith("allowed_"):
                 allowed = val
-                backoff_id = token_ids["<backoff>"]
-                assert backoff_id not in allowed, (
-                    "Backoff should be masked after b_max reached"
-                )
+                for bt in BACKOFF_TOKENS:
+                    assert token_ids[bt] not in allowed, (
+                        f"{bt} should be masked after b_max reached"
+                    )
 
 
 # --- Test 5: Batched log-probs match sequential ---
@@ -258,7 +256,7 @@ def test_batch_logprobs_with_backoff(setup):
         model, tokenizer, token_ids, config,
         forced_actions=[
             token_ids["<continue>"],
-            token_ids["<backoff>"],
+            token_ids["<backoff_1>"],
             token_ids[TERMINATE_TOKEN],
         ],
     )

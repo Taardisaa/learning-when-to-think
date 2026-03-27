@@ -1,22 +1,22 @@
 import torch
 from transformers import PreTrainedTokenizerBase, PreTrainedModel
 
-# The 5 new special tokens we add to the vocabulary.
+# The 4 new special tokens we add to the vocabulary.
 # <terminate> is NOT added — it reuses the existing </think> (id 248069 in Qwen3.5).
+# Backoff tokens encode both the action and rewind depth in a single token.
 NEW_SPECIAL_TOKENS = [
     "<continue>",
-    "<backoff>",
-    "<depth_1>",
-    "<depth_2>",
-    "<depth_3>",
+    "<backoff_1>",
+    "<backoff_2>",
+    "<backoff_3>",
 ]
 
 TERMINATE_TOKEN = "</think>"  # already in Qwen3.5 vocab
 TERMINATE_TOKEN_ID = 248069
 
-# Convenience groupings for masked sampling
-ACTION_TOKENS = ["<continue>", "<backoff>", TERMINATE_TOKEN]
-DEPTH_TOKENS = ["<depth_1>", "<depth_2>", "<depth_3>"]
+# All tokens the model can emit at decision points
+ACTION_TOKENS = ["<continue>", "<backoff_1>", "<backoff_2>", "<backoff_3>", TERMINATE_TOKEN]
+BACKOFF_TOKENS = ["<backoff_1>", "<backoff_2>", "<backoff_3>"]
 
 
 def setup_tokenizer_and_model(
@@ -25,8 +25,8 @@ def setup_tokenizer_and_model(
 ) -> dict[str, int]:
     """Add special tokens, resize embeddings, initialize new embeddings.
 
-    Returns a dict mapping token string -> token id for all action/depth tokens
-    plus <terminate>.
+    Returns a dict mapping token string -> token id for all action tokens
+    plus </think>.
     """
     # Add new tokens
     num_added = tokenizer.add_special_tokens(

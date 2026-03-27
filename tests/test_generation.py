@@ -38,19 +38,17 @@ class ForcedActionGenerator(BackoffGenerator):
         self._forced = forced_actions or []
         self._idx = 0
 
-    def _sample_masked(self, logits, allowed_ids, temperature, generated_ids=None):
-        if set(allowed_ids).issubset(set(self.action_ids)):
+    def _sample(self, logits, temperature, generated_ids=None):
+        token_id, lp = super()._sample(logits, temperature, generated_ids)
+        # If the naturally sampled token is an action token, override it
+        if token_id in self.action_ids:
             if self._idx < len(self._forced):
                 forced = self._forced[self._idx]
                 self._idx += 1
-                if forced in allowed_ids:
-                    logits_flat = logits[0, -1, :]
-                    mask = torch.full_like(logits_flat, float("-inf"))
-                    mask[allowed_ids] = 0.0
-                    masked = logits_flat + mask
-                    lp = torch.nn.functional.log_softmax(masked, dim=-1)[forced].item()
-                    return forced, lp
-        return super()._sample_masked(logits, allowed_ids, temperature, generated_ids)
+                logits_flat = logits[0, -1, :]
+                log_probs = torch.nn.functional.log_softmax(logits_flat, dim=-1)
+                return forced, log_probs[forced].item()
+        return token_id, lp
 
 
 # --- Cache mechanics ---
@@ -155,7 +153,7 @@ def test_forced_backoff_creates_backoff_segment(setup):
         model, tokenizer, token_ids, config,
         forced_actions=[
             token_ids["<continue>"],
-            token_ids["<backoff>"],
+            token_ids["<backoff_1>"],
             token_ids[TERMINATE_TOKEN],
         ],
     )
@@ -166,7 +164,7 @@ def test_forced_backoff_creates_backoff_segment(setup):
     assert traj.backoff_count == 1
     assert traj.terminated
 
-    backoff_segs = [s for s in traj.segments if s.depth is not None]
+    backoff_segs = [s for s in traj.segments if s.rewind_pos is not None]
     assert len(backoff_segs) == 1
     assert len(backoff_segs[0].directive_ids) > 0
     assert backoff_segs[0].rewind_pos is not None
@@ -180,7 +178,7 @@ def test_build_forward_pass_sequences(setup):
         model, tokenizer, token_ids, config,
         forced_actions=[
             token_ids["<continue>"],
-            token_ids["<backoff>"],
+            token_ids["<backoff_1>"],
             token_ids[TERMINATE_TOKEN],
         ],
     )
@@ -199,11 +197,10 @@ def test_build_forward_pass_sequences(setup):
 
     # Pass 1 should end with the last directive token (directive is generated
     # before truncation, so it's part of Pass 1 now)
-    backoff_seg = [s for s in traj.segments if s.depth is not None][0]
+    backoff_seg = [s for s in traj.segments if s.rewind_pos is not None][0]
     assert seqs[0][-1] == backoff_seg.directive_ids[-1]
-    # <backoff> and depth should also be in Pass 1
+    # <backoff_N> should be in Pass 1
     assert backoff_seg.action in seqs[0]
-    assert backoff_seg.depth in seqs[0]
 
     # Pass 2 should end with </think>
     assert seqs[1][-1] == token_ids[TERMINATE_TOKEN]
@@ -217,9 +214,9 @@ def test_forced_double_backoff(setup):
         model, tokenizer, token_ids, config,
         forced_actions=[
             token_ids["<continue>"],
-            token_ids["<backoff>"],
+            token_ids["<backoff_1>"],
             token_ids["<continue>"],
-            token_ids["<backoff>"],
+            token_ids["<backoff_1>"],
             token_ids[TERMINATE_TOKEN],
         ],
     )
@@ -230,7 +227,7 @@ def test_forced_double_backoff(setup):
     assert traj.backoff_count == 2
     assert traj.terminated
 
-    backoff_segs = [s for s in traj.segments if s.depth is not None]
+    backoff_segs = [s for s in traj.segments if s.rewind_pos is not None]
     assert len(backoff_segs) == 2
 
 
@@ -244,7 +241,7 @@ def test_backoff_masked_after_b_max(setup):
         model, tokenizer, token_ids, config,
         forced_actions=[
             token_ids["<continue>"],
-            token_ids["<backoff>"],
+            token_ids["<backoff_1>"],
             # After b_max=1 is used up, backoff is masked; model picks continue or terminate
         ],
     )

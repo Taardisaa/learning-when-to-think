@@ -8,7 +8,7 @@ from src.tokens import (
     TERMINATE_TOKEN,
     TERMINATE_TOKEN_ID,
     ACTION_TOKENS,
-    DEPTH_TOKENS,
+    BACKOFF_TOKENS,
     setup_tokenizer_and_model,
     enable_new_token_grad,
 )
@@ -68,11 +68,13 @@ def test_new_embeddings_not_zero():
         assert emb[tid].abs().sum() > 0, f"{tok} embedding is all zeros"
 
 
-def test_action_and_depth_groups():
+def test_action_and_backoff_groups():
     assert "<continue>" in ACTION_TOKENS
-    assert "<backoff>" in ACTION_TOKENS
+    assert "<backoff_1>" in ACTION_TOKENS
+    assert "<backoff_2>" in ACTION_TOKENS
+    assert "<backoff_3>" in ACTION_TOKENS
     assert TERMINATE_TOKEN in ACTION_TOKENS
-    assert len(DEPTH_TOKENS) == 3
+    assert len(BACKOFF_TOKENS) == 3
 
 
 def test_roundtrip_encode_decode():

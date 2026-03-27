@@ -22,15 +22,17 @@ from src.generation import BackoffGenerator
 
 def _generate_raw(model, tokenizer, prompt_ids, t_max):
     """Standard model.generate() — for base models without boundary tokens."""
+    attention_mask = torch.ones_like(prompt_ids)
     with torch.no_grad():
         output = model.generate(
             prompt_ids,
+            attention_mask=attention_mask,
             max_new_tokens=t_max,
             do_sample=False,
             temperature=None,
             top_p=None,
+            pad_token_id=tokenizer.eos_token_id,
         )
-    # Strip prompt tokens from output
     gen_ids = output[0, prompt_ids.shape[1]:]
     return tokenizer.decode(gen_ids, skip_special_tokens=True)
 
@@ -72,7 +74,7 @@ def main():
     token_ids = None
     id2name = {}
     if not use_raw:
-        from src.tokens import NEW_SPECIAL_TOKENS, ACTION_TOKENS, DEPTH_TOKENS
+        from src.tokens import NEW_SPECIAL_TOKENS, ACTION_TOKENS, BACKOFF_TOKENS
         all_special = NEW_SPECIAL_TOKENS + [TERMINATE_TOKEN]
         token_ids = {tok: tokenizer.convert_tokens_to_ids(tok) for tok in all_special}
         print(f"Token IDs: {token_ids}")
@@ -111,11 +113,10 @@ def main():
                 correct += 1
 
             print(f"\n{'='*70}")
-            print(f"Problem {i}: {ex['question'][:80]}...")
+            print(f"Problem {i}: {ex['question']}...")
             print(f"Gold: {ex['answer_number']}  Predicted: {predicted}  "
                   f"{'OK' if is_correct else 'WRONG'}")
-            # Show truncated output
-            print(f"  Output: {output_text[:200]}")
+            print(f"  Output: {output_text}")
         else:
             # BackoffGenerator for SFT'd model
             traj = gen.generate(prompt_ids)
@@ -132,23 +133,23 @@ def main():
                 correct += 1
 
             print(f"\n{'='*70}")
-            print(f"Problem {i}: {ex['question'][:80]}...")
+            print(f"Problem {i}: {ex['question']}...")
             print(f"Gold: {ex['answer_number']}  Predicted: {traj.answer_number}  "
                   f"{'OK' if is_correct else 'WRONG'}")
             print(f"Segments: {len(traj.segments)}  "
                   f"<continue>: {n_continue}  <backoff>: {n_backoff}  "
                   f"terminated: {traj.terminated}  gen_tokens: {traj.total_generated_tokens}")
 
-            for j, seg in enumerate(traj.segments[:8]):
+            for j, seg in enumerate(traj.segments):
                 action_name = id2name.get(seg.action, str(seg.action))
-                chunk_text = tokenizer.decode(seg.chunk_ids)[:100]
+                chunk_text = tokenizer.decode(seg.chunk_ids)
                 print(f"  Seg {j}: [{action_name}] {chunk_text}")
                 if seg.directive_ids:
-                    dir_text = tokenizer.decode(seg.directive_ids)[:80]
+                    dir_text = tokenizer.decode(seg.directive_ids)
                     print(f"         directive: {dir_text}")
 
             if traj.answer_text:
-                print(f"  Answer: {traj.answer_text[:150]}")
+                print(f"  Answer: {traj.answer_text}")
 
     print(f"\n{'='*70}")
     print(f"SUMMARY ({args.n} problems)")

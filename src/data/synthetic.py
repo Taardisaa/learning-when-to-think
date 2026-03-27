@@ -2,7 +2,7 @@
 
 Generates two types of examples from GSM8K gold solutions:
 - Clean (60%): steps with <continue> at boundaries, </think> + answer
-- Backoff (40%): inject wrong step, <backoff> <depth_1> [directive] <continue>,
+- Backoff (40%): inject wrong step, <backoff_N> [directive] <continue>,
   then correct continuation
 """
 
@@ -230,10 +230,10 @@ def build_backoff_example(
     Injects 1-3 wrong steps (depending on available steps), then backs off
     with the appropriate depth token to rewind past all wrong steps.
 
-    Depth distribution:
-      - <depth_1>: rewind 1 boundary (1 wrong step) — most common
-      - <depth_2>: rewind 2 boundaries (2 wrong steps)
-      - <depth_3>: rewind 3 boundaries (3 wrong steps)
+    Backoff distribution:
+      - <backoff_1>: rewind 1 boundary (1 wrong step) — most common
+      - <backoff_2>: rewind 2 boundaries (2 wrong steps)
+      - <backoff_3>: rewind 3 boundaries (3 wrong steps)
 
     Returns None if there aren't enough steps for a meaningful backoff.
     """
@@ -250,14 +250,14 @@ def build_backoff_example(
     else:
         num_wrong = 1
 
-    depth_token = f"<depth_{num_wrong}>"
+    backoff_token = f"<backoff_{num_wrong}>"
 
     # Pick where the wrong steps start (not the last step)
     latest_start = len(steps) - 1 - num_wrong
     if latest_start < 0:
         latest_start = 0
         num_wrong = len(steps) - 1
-        depth_token = f"<depth_{num_wrong}>"
+        backoff_token = f"<backoff_{num_wrong}>"
     error_start = rng.randint(0, max(0, latest_start))
 
     # Generate wrong versions of the affected steps
@@ -282,7 +282,7 @@ def build_backoff_example(
             parts.append(f"{wrong} <continue>")
         else:
             # Last wrong step: followed by backoff
-            parts.append(f"{wrong} <backoff> {depth_token} {directive} <continue>")
+            parts.append(f"{wrong} {backoff_token} {directive} <continue>")
 
     # Correct continuation from the error point
     for i in range(error_start, len(steps)):

@@ -6,10 +6,9 @@ import torch
 import torch.nn.functional as F
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
-from src.boundary import BoundaryTracker
 from src.config import BackoffConfig
 from src.data.gsm8k import extract_predicted_number
-from src.tokens import ACTION_TOKENS, DEPTH_TOKENS, TERMINATE_TOKEN
+from src.tokens import ACTION_TOKENS, BACKOFF_TOKENS, TERMINATE_TOKEN
 
 
 @dataclass
@@ -17,8 +16,7 @@ class Segment:
     """One chunk of generation between boundary decisions."""
 
     chunk_ids: list[int]  # tokens generated in the chunk
-    action: int  # action token id chosen at boundary
-    depth: int | None = None  # depth token id (backoff only)
+    action: int  # action token id (<continue>, <backoff_N>, or </think>)
     directive_ids: list[int] = field(default_factory=list)  # directive tokens (backoff only)
     force_continued: bool = False  # True if directive hit k_dir and <continue> was forced
     kv_start_pos: int = 0  # cache position at start of chunk
@@ -49,9 +47,8 @@ class TrajectoryRecord:
         pass — from the prompt through to the next backoff or termination.
 
         Pass boundaries occur at backoff events: everything before the crop
-        (including chunk + <backoff> + <depth>) forms one pass, and the
-        post-crop state (surviving prefix + directive + new chunks) forms
-        the next.
+        (including chunk + <backoff_N>) forms one pass, and the post-crop
+        state (surviving prefix + directive + new chunks) forms the next.
         """
         sequences: list[list[int]] = []
         # "active" = tokens currently surviving in the KV cache
@@ -62,11 +59,10 @@ class TrajectoryRecord:
             pass_tokens.extend(seg.chunk_ids)
             pass_tokens.append(seg.action)
 
-            if seg.depth is not None:
-                # Backoff: depth + directive are generated in the pre-truncation
-                # context (model sees the wrong tokens when writing the directive).
-                # All belong in this pass.
-                pass_tokens.append(seg.depth)
+            if seg.directive_ids:
+                # Backoff: directive is generated in the pre-truncation
+                # context (model sees the wrong tokens when writing the
+                # directive). All belong in this pass.
                 pass_tokens.extend(seg.directive_ids)
                 sequences.append(active + pass_tokens)
 
@@ -188,11 +184,11 @@ class BackoffGenerator:
         self.token_ids = token_ids
         self.config = config
 
-        # Pre-compute ID lists for masked sampling
+        # Pre-compute ID lists
         self.action_ids = [token_ids[t] for t in ACTION_TOKENS]
-        self.depth_ids = [token_ids[t] for t in DEPTH_TOKENS]
+        self.backoff_ids = [token_ids[t] for t in BACKOFF_TOKENS]
+        self.backoff_id_set = set(self.backoff_ids)
         self.continue_id = token_ids["<continue>"]
-        self.backoff_id = token_ids["<backoff>"]
         self.terminate_id = token_ids[TERMINATE_TOKEN]
 
     @torch.no_grad()
@@ -215,14 +211,22 @@ class BackoffGenerator:
         temperature: float | None = None,
         prefill: tuple | None = None,
     ) -> TrajectoryRecord:
-        """Generate a trajectory with backoff-aware decisions.
+        """Generate a trajectory with free token-by-token generation.
+
+        The model decides when to emit <continue>, <backoff>, or </think>
+        naturally — no forced boundaries or masked action sampling. When a
+        special token appears in the stream, we react:
+
+        - <continue>: save a cache snapshot (boundary), start new chunk.
+        - <backoff>: collect depth + directive tokens, then rewind the KV
+          cache to a prior snapshot and re-inject the directive.
+        - </think>: generate the answer and return.
 
         Args:
             prompt_ids: [1, seq_len] tensor of tokenized prompt.
             temperature: sampling temperature. None uses config default.
             prefill: (cache, logits) from prefill(). If provided, the cache
-                is deep-cloned so each rollout is independent — saves one
-                full forward pass per rollout.
+                is deep-cloned so each rollout is independent.
         """
         if temperature is None:
             temperature = self.config.temperature
@@ -239,12 +243,8 @@ class BackoffGenerator:
             next_logits = out.logits[:, -1:, :]
 
         # State tracking
-        full_sequence = list(prompt_list)  # all token IDs in the cache
-        boundaries = [prompt_len]  # cache positions at semantic boundaries
-        boundary_tracker = BoundaryTracker(self.config.k_min, self.config.k_max)
-
-        # Snapshot management: boundary_pos → snapshot
-        # Save initial snapshot at prompt end
+        full_sequence = list(prompt_list)
+        boundaries = [prompt_len]  # cache positions at <continue> boundaries
         snapshots: dict[int, _CacheSnapshot] = {
             prompt_len: _save_snapshot(cache, next_logits),
         }
@@ -254,108 +254,67 @@ class BackoffGenerator:
         total_log_prob = 0.0
         total_generated = 0
 
+        # Current chunk accumulator (tokens between boundary decisions)
+        chunk_ids: list[int] = []
+        chunk_log_prob = 0.0
+        chunk_start_pos = prompt_len
+
         while total_generated < self.config.t_max:
-            # ── GENERATE CHUNK ──
-            chunk_start_pos = len(full_sequence)
-            chunk_ids: list[int] = []
-            chunk_log_prob = 0.0
+            token, lp = self._sample(next_logits, temperature, full_sequence)
+            total_generated += 1
 
-            for _ in range(self.config.k_max):
-                token, lp = self._sample(next_logits, temperature, full_sequence)
-                chunk_ids.append(token)
-                chunk_log_prob += lp
-                total_generated += 1
+            if token == self.continue_id:
+                # ── BOUNDARY: save snapshot, record segment ──
                 full_sequence.append(token)
-
-                # Forward pass: feed token, get logits for next position
                 token_t = torch.tensor([[token]], device=device)
                 out = self.model(token_t, past_key_values=cache, use_cache=True)
                 next_logits = out.logits[:, -1:, :]
 
-                # Check boundary
-                tok_text = self.tokenizer.decode([token])
-                if boundary_tracker.step(tok_text):
-                    break
+                boundary_pos = len(full_sequence)
+                boundaries.append(boundary_pos)
+                snapshots[boundary_pos] = _save_snapshot(cache, next_logits)
+                self._prune_snapshots(snapshots, boundaries)
 
-                if total_generated >= self.config.t_max:
-                    break
-
-            boundary_pos = len(full_sequence)
-            boundaries.append(boundary_pos)
-
-            # Save snapshot at this boundary (before action token)
-            snapshots[boundary_pos] = _save_snapshot(cache, next_logits)
-            # Prune old snapshots: only keep those still in the boundaries stack
-            self._prune_snapshots(snapshots, boundaries)
-
-            if total_generated >= self.config.t_max:
-                # Record partial segment and bail
                 segments.append(Segment(
-                    chunk_ids=chunk_ids, action=-1,
+                    chunk_ids=chunk_ids, action=self.continue_id,
                     kv_start_pos=chunk_start_pos, kv_end_pos=boundary_pos,
                 ))
-                total_log_prob += chunk_log_prob
-                break
+                total_log_prob += chunk_log_prob + lp
 
-            # ── ACTION DECISION ──
-            # Logits from last chunk token predict the action
-            allowed = list(self.action_ids)
-            if backoff_count >= self.config.b_max:
-                allowed = [a for a in allowed if a != self.backoff_id]
+                # Reset chunk
+                chunk_ids = []
+                chunk_log_prob = 0.0
+                chunk_start_pos = boundary_pos
 
-            action, action_lp = self._sample_masked(next_logits, allowed, temperature, full_sequence)
-            total_generated += 1
-            full_sequence.append(action)
-
-            # Feed action token to model
-            action_t = torch.tensor([[action]], device=device)
-            out = self.model(action_t, past_key_values=cache, use_cache=True)
-            next_logits = out.logits[:, -1:, :]
-
-            # ── EXECUTE ACTION ──
-
-            if action == self.continue_id:
-                segments.append(Segment(
-                    chunk_ids=chunk_ids, action=action,
-                    kv_start_pos=chunk_start_pos, kv_end_pos=boundary_pos,
-                ))
-                total_log_prob += chunk_log_prob + action_lp
-
-            elif action == self.backoff_id:
+            elif token in self.backoff_id_set:
+                # ── BACKOFF: single token encodes action + depth ──
                 backoff_count += 1
-
-                # Sample depth token (model sees the wrong tokens)
-                depth, depth_lp = self._sample_masked(
-                    next_logits, self.depth_ids, temperature, full_sequence
-                )
-                total_generated += 1
-                full_sequence.append(depth)
-
-                # Feed depth token to model — still has wrong tokens in cache
-                depth_t = torch.tensor([[depth]], device=device)
-                out = self.model(depth_t, past_key_values=cache, use_cache=True)
+                backoff_lp = lp
+                backoff_action = token
+                full_sequence.append(token)
+                token_t = torch.tensor([[token]], device=device)
+                out = self.model(token_t, past_key_values=cache, use_cache=True)
                 next_logits = out.logits[:, -1:, :]
 
-                # ── GENERATE DIRECTIVE (before truncation) ──
-                # The directive is conditioned on the wrong tokens' hidden
-                # states, so the model can "see" what went wrong and write
-                # a specific correction (e.g., "26.53 is wrong, should be 27").
+                # Collect directive tokens until <continue> or k_dir limit
                 directive_ids: list[int] = []
                 directive_lp = 0.0
                 force_continued = False
 
                 for _ in range(self.config.k_dir):
-                    token, lp = self._sample(next_logits, temperature, full_sequence)
-                    directive_ids.append(token)
-                    directive_lp += lp
+                    d_token, d_lp = self._sample(
+                        next_logits, temperature, full_sequence
+                    )
+                    directive_ids.append(d_token)
+                    directive_lp += d_lp
                     total_generated += 1
-                    full_sequence.append(token)
+                    full_sequence.append(d_token)
 
-                    token_t = torch.tensor([[token]], device=device)
+                    token_t = torch.tensor([[d_token]], device=device)
                     out = self.model(token_t, past_key_values=cache, use_cache=True)
                     next_logits = out.logits[:, -1:, :]
 
-                    if token == self.continue_id:
+                    if d_token == self.continue_id:
                         break
 
                 # Force-append <continue> if directive didn't end with one
@@ -365,36 +324,33 @@ class BackoffGenerator:
                     full_sequence.append(self.continue_id)
                     total_generated += 1
 
-                # Compute rewind depth (1, 2, or 3)
-                depth_val = self.depth_ids.index(depth) + 1
+                # Depth is encoded in the backoff token itself
+                depth_val = self.backoff_ids.index(backoff_action) + 1
                 depth_val = min(depth_val, len(boundaries) - 1)
 
-                # Pop boundaries to find target
                 for _ in range(depth_val):
                     popped = boundaries.pop()
                     snapshots.pop(popped, None)
                 target_pos = boundaries[-1]
 
-                # Record segment
                 seg = Segment(
-                    chunk_ids=chunk_ids, action=action, depth=depth,
+                    chunk_ids=chunk_ids, action=backoff_action,
                     directive_ids=directive_ids,
                     force_continued=force_continued,
-                    kv_start_pos=chunk_start_pos, kv_end_pos=boundary_pos,
+                    kv_start_pos=chunk_start_pos,
+                    kv_end_pos=chunk_start_pos + len(chunk_ids),
                     rewind_pos=target_pos,
                 )
-                total_log_prob += chunk_log_prob + action_lp + depth_lp + directive_lp
+                total_log_prob += (
+                    chunk_log_prob + backoff_lp + directive_lp
+                )
 
-                # ── NOW TRUNCATE: restore snapshot to rewind point ──
+                # Rewind cache to target boundary
                 _restore_snapshot(cache, snapshots[target_pos])
                 full_sequence = full_sequence[:target_pos]
 
-                # ── RE-INJECT directive into the clean cache ──
-                # Feed directive tokens into the rewound cache so the
-                # continuation is conditioned on the correction.
-                directive_tensor = torch.tensor(
-                    [directive_ids], device=device
-                )
+                # Re-inject directive into the clean cache
+                directive_tensor = torch.tensor([directive_ids], device=device)
                 out = self.model(
                     directive_tensor, past_key_values=cache, use_cache=True
                 )
@@ -402,19 +358,30 @@ class BackoffGenerator:
                 full_sequence.extend(directive_ids)
 
                 segments.append(seg)
-                boundary_tracker.reset()
 
-            elif action == self.terminate_id:
-                # Record final segment
+                # Reset chunk
+                chunk_ids = []
+                chunk_log_prob = 0.0
+                chunk_start_pos = len(full_sequence)
+
+            elif token == self.terminate_id:
+                # ── TERMINATE: generate answer ──
+                full_sequence.append(token)
+                token_t = torch.tensor([[token]], device=device)
+                out = self.model(token_t, past_key_values=cache, use_cache=True)
+                next_logits = out.logits[:, -1:, :]
+
                 segments.append(Segment(
-                    chunk_ids=chunk_ids, action=action,
-                    kv_start_pos=chunk_start_pos, kv_end_pos=boundary_pos,
+                    chunk_ids=chunk_ids, action=self.terminate_id,
+                    kv_start_pos=chunk_start_pos,
+                    kv_end_pos=len(full_sequence),
                 ))
-                total_log_prob += chunk_log_prob + action_lp
+                total_log_prob += chunk_log_prob + lp
 
-                # Generate answer freely (greedy, no boundary tracking)
                 answer_ids = self._generate_answer(cache, next_logits, device)
-                answer_text = self.tokenizer.decode(answer_ids, skip_special_tokens=True)
+                answer_text = self.tokenizer.decode(
+                    answer_ids, skip_special_tokens=True
+                )
                 full_sequence.extend(answer_ids)
 
                 return TrajectoryRecord(
@@ -430,7 +397,25 @@ class BackoffGenerator:
                     terminated=True,
                 )
 
+            else:
+                # ── REGULAR TOKEN: accumulate into chunk ──
+                chunk_ids.append(token)
+                chunk_log_prob += lp
+                full_sequence.append(token)
+
+                token_t = torch.tensor([[token]], device=device)
+                out = self.model(token_t, past_key_values=cache, use_cache=True)
+                next_logits = out.logits[:, -1:, :]
+
         # T_max reached without termination
+        if chunk_ids:
+            segments.append(Segment(
+                chunk_ids=chunk_ids, action=-1,
+                kv_start_pos=chunk_start_pos,
+                kv_end_pos=len(full_sequence),
+            ))
+            total_log_prob += chunk_log_prob
+
         gen_text = self.tokenizer.decode(
             full_sequence[prompt_len:], skip_special_tokens=True
         )

@@ -1,7 +1,7 @@
 """Concrete running example of the backoff generation loop.
 
 Shows how cache truncation works step by step:
-- Forces a specific action sequence (continue → backoff → continue → terminate)
+- Forces a specific token sequence (continue → backoff_1 → continue → terminate)
 - Prints the full trace: chunk text, actions, cache positions, snapshot restore
 - Shows the forward pass sequences used for segment-wise log-prob in GRPO
 
@@ -13,31 +13,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.config import BackoffConfig
-from src.tokens import setup_tokenizer_and_model, TERMINATE_TOKEN, DEPTH_TOKENS
+from src.tokens import setup_tokenizer_and_model, TERMINATE_TOKEN, BACKOFF_TOKENS
 from src.generation import BackoffGenerator
-
-
-class DemoGenerator(BackoffGenerator):
-    """Generator that forces specific action choices for demonstration."""
-
-    def __init__(self, *a, forced_actions=None, **kw):
-        super().__init__(*a, **kw)
-        self._forced = forced_actions or []
-        self._idx = 0
-
-    def _sample_masked(self, logits, allowed_ids, temperature):
-        if set(allowed_ids).issubset(set(self.action_ids)):
-            if self._idx < len(self._forced):
-                forced = self._forced[self._idx]
-                self._idx += 1
-                if forced in allowed_ids:
-                    logits_flat = logits[0, -1, :]
-                    mask = torch.full_like(logits_flat, float("-inf"))
-                    mask[allowed_ids] = 0.0
-                    masked = logits_flat + mask
-                    lp = torch.nn.functional.log_softmax(masked, dim=-1)[forced].item()
-                    return forced, lp
-        return super()._sample_masked(logits, allowed_ids, temperature)
 
 
 def main():
@@ -50,17 +27,9 @@ def main():
     token_ids = setup_tokenizer_and_model(tokenizer, model)
 
     config = BackoffConfig(
-        t_max=512, k_min=10, k_max=25, temperature=0.0, k_dir=8, b_max=2
+        t_max=512, temperature=0.0, k_dir=8,
     )
-    gen = DemoGenerator(
-        model, tokenizer, token_ids, config,
-        forced_actions=[
-            token_ids["<continue>"],      # after chunk 1
-            token_ids["<backoff>"],        # after chunk 2 → backoff!
-            token_ids["<continue>"],       # after chunk 3
-            token_ids[TERMINATE_TOKEN],    # after chunk 4 → done
-        ],
-    )
+    gen = BackoffGenerator(model, tokenizer, token_ids, config)
 
     question = "What is 15 + 27?"
     messages = [
@@ -79,6 +48,7 @@ def main():
 
     # ── Print the full story ──
     id2name = {v: k for k, v in token_ids.items()}
+    backoff_id_set = set(token_ids[t] for t in BACKOFF_TOKENS)
 
     print("=" * 80)
     print("BACKOFF GENERATION TRACE")
@@ -93,25 +63,20 @@ def main():
 
         chunk_text = tokenizer.decode(seg.chunk_ids)
         print(f"  Chunk ({len(seg.chunk_ids)} tokens, pos {seg.kv_start_pos}→{seg.kv_end_pos}):")
-        print(f"    \"{chunk_text[:200]}\"")
+        print(f"    \"{chunk_text}\"")
         print(f"  Action: {action_name}")
 
-        if seg.depth is not None:
-            depth_name = id2name.get(seg.depth, str(seg.depth))
-            depth_val = (
-                DEPTH_TOKENS.index(depth_name) + 1
-                if depth_name in DEPTH_TOKENS else "?"
-            )
-            print(f"  Depth:  {depth_name} (rewind {depth_val} boundary)")
+        if seg.action in backoff_id_set:
+            depth_val = BACKOFF_TOKENS.index(action_name) + 1 if action_name in BACKOFF_TOKENS else "?"
+            print(f"  Rewind depth: {depth_val} boundary(ies)")
             print(f"  Rewind target: position {seg.rewind_pos}")
             print()
-            print(f"  ┌─ BEFORE BACKOFF: cache has {seg.kv_end_pos + 2} tokens")
-            print(f"  │  (chunk={seg.kv_end_pos - seg.kv_start_pos}, "
-                  f"+<backoff>, +{depth_name})")
+            print(f"  ┌─ BEFORE BACKOFF: cache has {seg.kv_end_pos + 1} tokens")
+            print(f"  │  (chunk={seg.kv_end_pos - seg.kv_start_pos}, +{action_name})")
             print(f"  │")
             print(f"  │  TRUNCATE: crop cache from "
-                  f"{seg.kv_end_pos + 2} → {seg.rewind_pos}")
-            print(f"  │  (deleted {seg.kv_end_pos + 2 - seg.rewind_pos} tokens)")
+                  f"{seg.kv_end_pos + 1} → {seg.rewind_pos}")
+            print(f"  │  (deleted {seg.kv_end_pos + 1 - seg.rewind_pos} tokens)")
             print(f"  │")
 
             dir_text = tokenizer.decode(seg.directive_ids)
@@ -128,7 +93,7 @@ def main():
     print(f"ANSWER")
     print(f"{'─' * 80}")
     if traj.answer_text:
-        print(f"  Text: \"{traj.answer_text[:300]}\"")
+        print(f"  Text: \"{traj.answer_text}\"")
     print(f"  Extracted number: {traj.answer_number}")
 
     print(f"\n{'─' * 80}")
@@ -149,10 +114,7 @@ def main():
     for j, seq in enumerate(seqs):
         text = tokenizer.decode(seq)
         print(f"\n  Pass {j} ({len(seq)} tokens):")
-        if len(text) > 300:
-            print(f"    ...{text[-250:]}")
-        else:
-            print(f"    {text}")
+        print(f"    {text}")
 
 
 if __name__ == "__main__":

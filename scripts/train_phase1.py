@@ -1,7 +1,7 @@
 """Phase 1: SFT warm-up — teach the model the backoff token format.
 
 Trains LoRA on Qwen3.5 with synthetic SFT data containing <continue>,
-<backoff>, <depth_*>, and </think> tokens. New token embeddings are
+<backoff_1/2/3>, and </think> tokens. New token embeddings are
 selectively unfrozen via gradient masking.
 
 Usage:
@@ -43,6 +43,8 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
     parser.add_argument("--data", default="data/sft_train.jsonl")
     parser.add_argument("--output", default="checkpoints/phase1/final")
+    parser.add_argument("--resume-from", default=None,
+                        help="Checkpoint dir to resume training from")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -123,7 +125,7 @@ def main():
     )
 
     print("\nStarting training...")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_from)
 
     # ── Save ──
     print(f"\nSaving to {output_dir}...")
