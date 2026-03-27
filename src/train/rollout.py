@@ -6,7 +6,8 @@ import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from src.config import BackoffConfig
-from src.generation import BackoffGenerator, TrajectoryRecord
+from src.generation import TrajectoryRecord
+from src.generation_batched import BatchedBackoffGenerator
 
 
 @torch.no_grad()
@@ -20,9 +21,10 @@ def generate_rollouts(
 ) -> list[TrajectoryRecord]:
     """Generate G rollouts for a single question.
 
-    Uses temperature > 0 for diverse trajectories.
+    Uses batched generation: one model forward pass per autoregressive
+    step processes all G rollouts simultaneously.
     """
-    gen = BackoffGenerator(model, tokenizer, token_ids, config)
+    gen = BatchedBackoffGenerator(model, tokenizer, token_ids, config)
 
     messages = [{"role": "user", "content": (
         f"{config.system_prompt}\n\n{question}"
@@ -34,9 +36,4 @@ def generate_rollouts(
     device = next(model.parameters()).device
     prompt_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(device)
 
-    trajectories = []
-    for _ in range(num_rollouts):
-        traj = gen.generate(prompt_ids, temperature=config.temperature)
-        trajectories.append(traj)
-
-    return trajectories
+    return gen.generate_batch(prompt_ids, G=num_rollouts, temperature=config.temperature)

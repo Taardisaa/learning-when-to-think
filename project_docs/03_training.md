@@ -55,7 +55,7 @@ For each prompt $x$, sample $G$ trajectories $\{\tau_1, \ldots, \tau_G\}$:
 - Backoff positions and directive texts
 - Final answer
 
-**Step 2: Reward.** Compute $R(\tau_i) = r(\hat{a}_i, a^*) - \lambda_{\text{tok}} \cdot T_{\text{net}}(\tau_i)$
+**Step 2: Reward.** Compute $R(\tau_i) = r(\hat{a}_i, a^*) + \alpha \sum_j r_{\text{prg}}(\mathbf{z}_j; \mathbf{c}_{j-1})$
 
 **Step 3: Advantages.** Group-relative:
 
@@ -132,9 +132,14 @@ Cap directive at $K_{\text{dir}} \leq 20$ tokens. If the model hasn't emitted $\
 
 ## On Custom RL Methods (RH #5)
 
-### Decision: Start with vanilla GRPO
+### Decision: GRPO + MRT-style progress reward
 
-A custom method adds complexity and muddies the contribution. The paper's novelty is **backoff as a reasoning mechanism**, not a new RL algorithm. Using standard GRPO isolates the contribution cleanly.
+The dense per-segment progress signal (adapted from MRT, Qu et al. 2025) is a principled addition to vanilla GRPO, not a custom RL algorithm. It replaces the ad-hoc token penalty ($\lambda_{\text{tok}} \cdot T_{\text{net}}$) and exploration bonus ($\lambda_{\text{explore}}$) with a single, well-motivated dense reward that gives each segment credit proportional to how much it helped reach the correct answer.
+
+This is a clean contribution because:
+- It uses standard GRPO mechanics (clipped surrogate + KL)
+- The only addition is a reward shaping term with clear theoretical motivation (cumulative regret minimisation)
+- The paper's novelty remains **backoff as a reasoning mechanism** — the progress reward is how we train it effectively
 
 ### When to reconsider
 
@@ -143,11 +148,10 @@ If during training we observe specific failure modes, a targeted fix becomes jus
 | Failure mode | Possible custom fix |
 |-------------|-------------------|
 | Backoff rate collapses to 0% (model never backs off) | Separate KL coefficient for action tokens: $\beta_{\text{action}} < \beta_{\text{reason}}$ so the model is freer to explore backoff |
-| Backoff rate explodes to 80%+ (model always backs off) | Add explicit backoff penalty to reward, or anneal backoff availability |
+| Backoff rate explodes to 80%+ (model always backs off) | Reduce $\alpha$ or add a small backoff penalty |
+| Progress signal is too noisy (greedy probes disagree) | Increase `num_probes` for smoother estimates |
 | Directive tokens are always identical / generic | Increase entropy bonus specifically on directive tokens |
 | Post-backoff reasoning repeats deleted content | Add a similarity penalty between deleted segment and post-backoff segment |
-
-Each of these would be a **motivated modification** to GRPO, not a speculative new algorithm. A paper that says "we tried GRPO, observed X failure, and fixed it with Y" is stronger than one that proposes Y without showing X first.
 
 ### If we do propose something, the natural angle
 

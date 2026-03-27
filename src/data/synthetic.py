@@ -17,29 +17,48 @@ from src.data.gsm8k import load_gsm8k
 
 # ── Directives for backoff examples ──
 
-ARITHMETIC_DIRECTIVES = [
-    "The calculation was wrong, redo carefully.",
-    "Check the arithmetic again.",
-    "That math is incorrect, recalculate.",
-    "Wrong result, try the computation again.",
-    "The numbers don't add up, redo this step.",
-]
+def _make_arithmetic_directive(
+    wrong_num: str, correct_num: str, rng: random.Random
+) -> str:
+    """Generate a specific directive referencing the actual arithmetic error."""
+    templates = [
+        f"{wrong_num} is wrong, it should be {correct_num}",
+        f"that gives {wrong_num} but the correct result is {correct_num}",
+        f"got {wrong_num}, recalculate — the answer is {correct_num}",
+        f"error: {wrong_num} instead of {correct_num}, redo",
+        f"the result should be {correct_num} not {wrong_num}",
+    ]
+    return rng.choice(templates)
 
-COPY_DIRECTIVES = [
-    "Used the wrong number from a previous step, check again.",
-    "That references an incorrect value, look back at the earlier steps.",
-    "Wrong number carried forward, recheck.",
-    "The value from the prior step was copied incorrectly.",
-    "Go back and use the correct number.",
-]
 
-GENERIC_DIRECTIVES = [
-    "That step has an error, redo it.",
-    "Something went wrong, try again.",
-    "This reasoning is off, reconsider.",
-    "Let me rethink this step.",
-    "That doesn't look right, redo.",
-]
+def _make_copy_directive(
+    wrong_num: str, correct_num: str, rng: random.Random
+) -> str:
+    """Generate a directive for a wrong-number-carried-forward error."""
+    templates = [
+        f"used {wrong_num} but should be {correct_num} from earlier",
+        f"wrong value: {wrong_num}, the correct one is {correct_num}",
+        f"carried {wrong_num} forward incorrectly, it's {correct_num}",
+        f"should use {correct_num} not {wrong_num}",
+        f"the value {wrong_num} is from the wrong step, use {correct_num}",
+    ]
+    return rng.choice(templates)
+
+
+def _make_step_directive(wrong_step: str, correct_step: str, rng: random.Random) -> str:
+    """Generate a directive that quotes part of the correct step as guidance.
+
+    Used when we can't identify specific wrong/correct numbers (e.g., no
+    numbers in the step). Gives the model a concrete target to aim for.
+    """
+    # Take first ~60 chars of correct step as a hint
+    hint = correct_step[:60].strip()
+    templates = [
+        f"redo: {hint}",
+        f"should be: {hint}",
+        f"correct version: {hint}",
+    ]
+    return rng.choice(templates)
 
 
 def parse_steps(answer_text: str) -> list[str]:
@@ -109,47 +128,70 @@ def _perturb_number(num_str: str, rng: random.Random) -> str:
 
 
 def make_wrong_step(step: str, rng: random.Random) -> tuple[str, str]:
-    """Create a wrong version of a step and pick a directive.
+    """Create a wrong version of a step and a specific directive.
 
-    Returns (wrong_step, directive).
+    Returns (wrong_step, directive) where directive references the actual
+    wrong and correct values.
     """
     numbers = _find_numbers(step)
     if not numbers:
-        # No numbers to perturb — use generic error
-        return step + " (this seems off)", rng.choice(GENERIC_DIRECTIVES)
+        # No numbers — swap a word to make it wrong, use step-level directive
+        words = step.split()
+        if len(words) > 3:
+            i = rng.randint(1, len(words) - 2)
+            wrong_step = " ".join(words[:i] + ["WRONG"] + words[i+1:])
+        else:
+            wrong_step = step + " (wrong)"
+        return wrong_step, _make_step_directive(wrong_step, step, rng)
 
-    # Pick error type
     error_type = rng.choice(["arithmetic", "copy"])
 
-    if error_type == "arithmetic" and len(numbers) >= 1:
-        # Perturb the last number in the step (typically the result)
+    if error_type == "arithmetic":
         idx = len(numbers) - 1
         start, end, num_str = numbers[idx]
         wrong_num = _perturb_number(num_str, rng)
-        # Avoid no-op perturbation
         if wrong_num == num_str:
             wrong_num = str(int(float(num_str)) + rng.choice([3, -3, 7, -7]))
         wrong_step = step[:start] + wrong_num + step[end:]
-        directive = rng.choice(ARITHMETIC_DIRECTIVES)
+        directive = _make_arithmetic_directive(wrong_num, num_str, rng)
     else:
-        # Copy error: replace a number with one from elsewhere in the step
         if len(numbers) >= 2:
+            # Find pairs with different values for copy error
             target_idx = rng.randint(0, len(numbers) - 1)
-            source_idx = rng.choice(
-                [i for i in range(len(numbers)) if i != target_idx]
-            )
-            start, end, _ = numbers[target_idx]
-            _, _, source_num = numbers[source_idx]
-            wrong_step = step[:start] + source_num + step[end:]
-            directive = rng.choice(COPY_DIRECTIVES)
+            candidates = [
+                i for i in range(len(numbers))
+                if i != target_idx and numbers[i][2] != numbers[target_idx][2]
+            ]
+            if candidates:
+                source_idx = rng.choice(candidates)
+                start, end, correct_num = numbers[target_idx]
+                _, _, wrong_num = numbers[source_idx]
+                wrong_step = step[:start] + wrong_num + step[end:]
+                directive = _make_copy_directive(wrong_num, correct_num, rng)
+            else:
+                # All numbers are the same — fall back to arithmetic error
+                start, end, num_str = numbers[-1]
+                wrong_num = _perturb_number(num_str, rng)
+                if wrong_num == num_str:
+                    wrong_num = str(int(float(num_str)) + rng.choice([3, -3, 7, -7]))
+                wrong_step = step[:start] + wrong_num + step[end:]
+                directive = _make_arithmetic_directive(wrong_num, num_str, rng)
         else:
-            # Only one number — fall back to arithmetic error
             start, end, num_str = numbers[0]
             wrong_num = _perturb_number(num_str, rng)
             if wrong_num == num_str:
                 wrong_num = str(int(float(num_str)) + 5)
             wrong_step = step[:start] + wrong_num + step[end:]
-            directive = rng.choice(ARITHMETIC_DIRECTIVES)
+            directive = _make_arithmetic_directive(wrong_num, num_str, rng)
+
+    # Final safety: if the wrong step is identical to the original,
+    # force a visible arithmetic perturbation
+    if wrong_step.strip() == step.strip():
+        idx = len(numbers) - 1
+        start, end, num_str = numbers[idx]
+        forced_wrong = str(int(float(num_str)) + rng.choice([5, -5, 10, -10]))
+        wrong_step = step[:start] + forced_wrong + step[end:]
+        directive = _make_arithmetic_directive(forced_wrong, num_str, rng)
 
     return wrong_step, directive
 
@@ -183,34 +225,67 @@ def build_backoff_example(
     answer: str,
     rng: random.Random,
 ) -> str | None:
-    """Build a backoff SFT example with an injected error.
+    """Build a backoff SFT example with injected error(s).
 
-    Picks a step to corrupt, injects the error, then adds:
-        <backoff> <depth_1> [directive] <continue>
-    followed by the correct continuation.
+    Injects 1-3 wrong steps (depending on available steps), then backs off
+    with the appropriate depth token to rewind past all wrong steps.
+
+    Depth distribution:
+      - <depth_1>: rewind 1 boundary (1 wrong step) — most common
+      - <depth_2>: rewind 2 boundaries (2 wrong steps)
+      - <depth_3>: rewind 3 boundaries (3 wrong steps)
 
     Returns None if there aren't enough steps for a meaningful backoff.
     """
     if len(steps) < 2:
         return None
 
-    # Pick which step to make wrong (not the first or last)
-    if len(steps) == 2:
-        error_idx = 0
+    # Decide how many wrong steps to inject (1, 2, or 3)
+    # Weighted toward 1: [60% depth_1, 25% depth_2, 15% depth_3]
+    max_wrong = min(3, len(steps) - 1)  # leave at least 1 correct step at end
+    if max_wrong >= 3 and rng.random() < 0.15:
+        num_wrong = 3
+    elif max_wrong >= 2 and rng.random() < 0.35:
+        num_wrong = 2
     else:
-        error_idx = rng.randint(0, len(steps) - 2)
+        num_wrong = 1
 
-    wrong_step, directive = make_wrong_step(steps[error_idx], rng)
+    depth_token = f"<depth_{num_wrong}>"
 
+    # Pick where the wrong steps start (not the last step)
+    latest_start = len(steps) - 1 - num_wrong
+    if latest_start < 0:
+        latest_start = 0
+        num_wrong = len(steps) - 1
+        depth_token = f"<depth_{num_wrong}>"
+    error_start = rng.randint(0, max(0, latest_start))
+
+    # Generate wrong versions of the affected steps
+    # Keep the directive from the last wrong step (most specific)
+    wrong_steps = []
+    directive = ""
+    for i in range(num_wrong):
+        wrong, d = make_wrong_step(steps[error_start + i], rng)
+        wrong_steps.append(wrong)
+        directive = d  # use the last one — most relevant to the backoff point
+
+    # Build the example
     parts = ["<think>"]
-    for i in range(error_idx):
+
+    # Correct steps before the error
+    for i in range(error_start):
         parts.append(f"{steps[i]} <continue>")
 
-    # Wrong step followed by backoff
-    parts.append(f"{wrong_step} <backoff> <depth_1> {directive} <continue>")
+    # Wrong steps with <continue> between them
+    for i, wrong in enumerate(wrong_steps):
+        if i < len(wrong_steps) - 1:
+            parts.append(f"{wrong} <continue>")
+        else:
+            # Last wrong step: followed by backoff
+            parts.append(f"{wrong} <backoff> {depth_token} {directive} <continue>")
 
     # Correct continuation from the error point
-    for i in range(error_idx, len(steps)):
+    for i in range(error_start, len(steps)):
         if i < len(steps) - 1:
             parts.append(f"{steps[i]} <continue>")
         else:

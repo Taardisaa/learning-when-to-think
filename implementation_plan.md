@@ -83,7 +83,7 @@ Central `BackoffConfig` dataclass. All hyperparameters:
 - Model: `model_name`, LoRA params (r=16, alpha=32, targets=q/k/v/o)
 - Boundary: `k_min=15`, `k_max=80`
 - Backoff: `d_max=3`, `k_dir=20`, `b_max=2`, `t_max=2048`
-- Reward: `lambda_tok=0.0001`, `lambda_explore=0.1`, `anneal_steps=500`
+- Reward: `alpha=0.5`, `num_probes=1` (MRT-style progress reward)
 - GRPO: `num_rollouts=4`, `clip_epsilon=0.2`, `kl_coef=0.01`, `lr=1e-4`
 - SFT: `epochs=3`, `lr=2e-5`, `max_seq_len=2048`
 
@@ -108,7 +108,7 @@ Adapt from Ivan's `marie/ivan:src/data/gsm8k.py`:
 
 ---
 
-## Milestone 2: Backoff-Aware Generation Loop 
+## Milestone 2: Backoff-Aware Generation Loop DONE
 
 **File**: `src/generation.py`
 
@@ -151,7 +151,7 @@ generate(prompt_ids) -> TrajectoryRecord
 
 ---
 
-## Milestone 3: Synthetic SFT Data Generation
+## Milestone 3: Synthetic SFT Data Generation DONE
 
 **File**: `src/data/synthetic.py`, `scripts/generate_sft_data.py`
 
@@ -186,7 +186,7 @@ Solve the following math problem...
 
 ---
 
-## Milestone 4: Phase 1 -- SFT Warm-Up
+## Milestone 4: Phase 1 -- SFT Warm-Up DONE
 
 **Files**: `src/train/sft.py`, `scripts/train_phase1.py`
 
@@ -205,7 +205,7 @@ Solve the following math problem...
 
 ---
 
-## Milestone 5: Segment-Wise Forward Pass (hardest component)
+## Milestone 5: Segment-Wise Forward Pass (hardest component) DONE
 
 **File**: `src/train/logprobs.py`
 
@@ -241,17 +241,24 @@ Same function, but called with `torch.no_grad()` on the frozen reference model.
 
 ---
 
-## Milestone 6: Phase 2 -- GRPO + Exploration Bonus
+## Milestone 6: Phase 2 -- GRPO with Progress Reward
 
 **Files**: `src/train/reward.py`, `src/train/rollout.py`, `src/train/grpo.py`, `scripts/train_phase2.py`
 
 ### `reward.py`
 ```python
-R(tau) = correctness - lambda_tok * T_net + lambda_explore * has_backoff
+R(tau) = correctness + alpha * sum(r_prg(z_j))
 ```
 - `correctness`: 1.0 if exact match, else 0.0
-- `T_net`: `trajectory.final_kv_length` (net tokens, not gross)
-- Exploration bonus anneals: `lambda_explore(step) = lambda_explore * max(0, 1 - step/anneal_steps)`
+- `r_prg(z_j)`: per-segment progress = meta-prover accuracy after segment j minus before
+- Meta-prover: same model, force `</think>`, greedy decode, check answer
+- `alpha=0.5`: weight on dense progress signal
+- `num_probes=1`: greedy meta-prover (cheap; increase for smoother signal)
+
+No token penalty, no exploration bonus. Progress reward subsumes both:
+- Wasteful tokens → zero/negative progress (implicit efficiency pressure)
+- Good backoffs → large positive progress (implicit exploration reward)
+- Bad backoffs → negative progress (implicit penalty)
 
 ### `rollout.py`
 - `generate_rollouts(model, tokenizer, token_ids, question, config, G)` -> list of `TrajectoryRecord`
@@ -260,7 +267,7 @@ R(tau) = correctness - lambda_tok * T_net + lambda_explore * has_backoff
 ### `grpo.py` -- `grpo_step()`
 For each question in batch:
 1. Generate G=4 rollouts (no grad)
-2. Compute rewards, group-relative advantages: `A_i = (R_i - mean) / std`
+2. Compute rewards (outcome + per-segment progress), group-relative advantages: `A_i = (R_i - mean) / std`
 3. For each rollout with |A_i| > eps:
    a. `log_pi_theta = compute_trajectory_logprobs(model, traj)` (with grad)
    b. `rho = exp(log_pi_theta - traj.stored_log_prob)` (importance ratio)
@@ -278,26 +285,15 @@ For each question in batch:
 - Load Phase 1 checkpoint, apply new LoRA for Phase 2
 - AdamW optimizer, lr=1e-4
 - Train on GSM8K train set (500 problems)
-- Log per step: loss, avg_reward, accuracy, backoff_rate, avg_T_net
+- Log per step: loss, avg_reward, accuracy, backoff_rate, avg_progress
 - Save checkpoints every 100 steps
-- Transition to Phase 3 when backoff_rate stabilizes at 10-50% and lambda_explore ~ 0
 
 **Verify**:
 - Run 10 steps on 10 problems: loss is finite, gradients non-zero, backoff_rate > 0%
 - Memory fits in 96GB (Qwen3.5-0.8B: ~1.6GB bf16, x2 for train+ref, + activations)
+- Progress values are in [-1, +1] range (sanity check)
 
----
-
-## Milestone 7: Phase 3 -- Pure GRPO
-
-**File**: `scripts/train_phase3.py`
-
-Identical to Phase 2 but `lambda_explore = 0` throughout. Loads Phase 2 checkpoint.
-
-**Monitor**:
-- If backoff_rate drops to <5%: backoff isn't helping (H1 may fail for this model size)
-- If backoff_rate stays 10-30%: model has learned when backoff is useful
-- If backoff_rate >50%: over-reliance, may need backoff penalty
+**Note**: Phase 3 (pure outcome GRPO) is no longer needed as a separate phase. The progress reward provides dense signal throughout training. If needed, `alpha` can be annealed down late in training to emphasise outcome.
 
 ---
 
@@ -311,9 +307,9 @@ Identical to Phase 2 but `lambda_explore = 0` throughout. Loads Phase 2 checkpoi
 3. **Base model**: existing baseline numbers from `baselines/`
 
 ### Metrics
-- Accuracy, avg T_net, backoff_rate, avg depth, cost_per_correct
+- Accuracy, avg tokens, backoff_rate, avg depth, avg progress, cost_per_correct
 - Wilson score 95% CI (from Ivan's `wilson_ci()`)
-- Token savings: `(T_forward - T_net_backoff) / T_forward`
+- Token savings: `(T_forward - T_backoff) / T_forward`
 
 ### Comparison output
 - JSON results file per evaluation
@@ -374,5 +370,5 @@ M10: Orchestration                       (depends on all)
 1. **Segment-wise forward pass correctness** (M5) -- if log-probs are wrong, GRPO won't converge. Extensive unit testing required.
 2. **KV cache position IDs after crop** -- must use correct `cache_position` parameter. Test thoroughly.
 3. **Action token log-prob masking** -- must match the masked distribution used during sampling, not full vocab.
-4. **Exploration failure** -- if backoff_rate stays at 0% in Phase 2, increase lambda_explore or temperature for action decisions.
+4. **Exploration failure** -- if backoff_rate stays at 0% in Phase 2, increase temperature for action decisions or lower KL coefficient for action tokens.
 5. **transformers 5.x upgrade** -- may break vLLM. Acceptable since baselines are computed; training eval uses transformers directly.

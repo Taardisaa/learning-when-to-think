@@ -30,8 +30,18 @@
 - Singhi et al. (2025) — solution generation usually more efficient than verification
 - ParaThinker (Wen et al.) — width scaling via parallel paths
 
+### Self-Correction & Error Detection
+- Huang et al. (2024), "Large Language Models Cannot Self-Correct Reasoning Yet" — shows prompting-based self-correction is unreliable; models change correct answers to wrong as often as they fix mistakes. Key pessimistic baseline: intrinsic self-correction via prompting ≈ noise
+- STaR / Self-Taught Reasoner (Zelikman et al., 2022) — iteratively trains on own correct traces; self-improvement via filtering, not online correction
+- RISE (Qu et al., 2024) — multi-turn RL for iterative refinement; shows improvement when model gets multiple attempts, but appends rather than rewinding
+- GLoRE (Havrilla et al., 2024) — trains separate verifier to score intermediate steps; external signal enables correction but requires a second model
+- DeepSeek-R1 (2025) — self-correction behavior ("wait, that's wrong") emerges from GRPO training on outcome reward alone, without explicit correction tokens. Key positive evidence that RL can discover self-correction without teaching it explicitly
+
+**Critical distinction for our work**: prompting-based self-correction fails (Huang et al.), but RL-trained self-correction can work (DeepSeek-R1, RISE). Our approach differs from both: we make backoff a discrete, learned action with KV cache truncation (reclaiming context), rather than appending corrections that consume additional context.
+
 ### RL for Reasoning
 - PPO (Schulman et al., 2017) — stable policy gradient method
+- GRPO (Shao et al., 2024) — group relative policy optimization, no value network needed; used in DeepSeek-R1
 - Setlur et al. (2025) — RL with negative gradients for exploratory search
 
 ## Identified Gaps (From Synthesis)

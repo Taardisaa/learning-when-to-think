@@ -1,7 +1,7 @@
-"""Phase 2: GRPO with exploration bonus.
+"""Phase 2: GRPO with progress reward.
 
 Loads Phase 1 checkpoint (merge LoRA → base), applies fresh LoRA for Phase 2,
-trains with GRPO on GSM8K.
+trains with GRPO + dense per-segment progress signal on GSM8K.
 
 Usage:
     python -m scripts.train_phase2
@@ -46,6 +46,9 @@ def load_phase1_as_base(base_model_name: str, phase1_path: str, device: str = "c
     # Load and merge Phase 1 LoRA
     model = PeftModel.from_pretrained(base_model, phase1_path)
     model = model.merge_and_unload()
+    # Clean up stale peft_config left by merge_and_unload
+    if hasattr(model, "peft_config"):
+        delattr(model, "peft_config")
 
     # Build token_ids from tokenizer
     all_special = NEW_SPECIAL_TOKENS + [TERMINATE_TOKEN]
@@ -118,8 +121,8 @@ def main():
     config = BackoffConfig(
         num_rollouts=args.num_rollouts,
         lr=args.lr,
-        lambda_explore=0.1,
-        anneal_steps=args.steps,
+        alpha=0.5,
+        num_probes=1,
     )
 
     # ── Optimizer ──
@@ -164,7 +167,7 @@ def main():
             "avg_reward": round(stats.avg_reward, 4),
             "accuracy": round(stats.accuracy, 4),
             "backoff_rate": round(stats.backoff_rate, 4),
-            "avg_t_net": round(stats.avg_t_net, 1),
+            "avg_progress": round(stats.avg_progress, 4),
             "avg_rho": round(stats.avg_rho, 4),
             "num_traj": stats.num_trajectories,
         }
@@ -172,7 +175,7 @@ def main():
         if step % 10 == 0 or step <= 5:
             print(f"Step {step:4d} | loss={stats.loss:.3f} reward={stats.avg_reward:.3f} "
                   f"acc={stats.accuracy:.2f} backoff={stats.backoff_rate:.2f} "
-                  f"T_net={stats.avg_t_net:.0f} rho={stats.avg_rho:.3f}")
+                  f"progress={stats.avg_progress:.3f} rho={stats.avg_rho:.3f}")
 
         with open(log_file, "a") as f:
             f.write(json.dumps(log_entry) + "\n")

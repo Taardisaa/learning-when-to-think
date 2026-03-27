@@ -223,21 +223,27 @@ where $\mathbf{h}_{n_t}'$ is the hidden state after appending the $\langle\textt
 
 ### Reward
 
-**Phase 3 (final):**
+$$R(\tau) = r(\hat{a}, a^*) + \alpha \sum_{j=0}^{k-1} r_{\text{prg}}(\mathbf{z}_j; \mathbf{c}_{j-1})$$
 
-$$R(\tau) = r(\hat{a}, a^*) - \lambda_{\text{tok}} \cdot T_{\text{net}}(\tau)$$
+Two terms:
+- $r(\hat{a}, a^*) \in \{0, 1\}$ — **outcome**: binary correctness (exact match).
+- $r_{\text{prg}}(\mathbf{z}_j; \mathbf{c}_{j-1})$ — **progress**: per-segment dense reward, measuring the change in meta-prover accuracy before vs. after segment $j$. Adapted from MRT (Qu et al., 2025).
 
-**Phase 2 (exploration):**
+**Progress reward.** At each segment boundary, we force the model to terminate thinking (append `</think>`) and greedily decode an answer. Progress for segment $j$ is:
 
-$$R(\tau) = r(\hat{a}, a^*) - \lambda_{\text{tok}} \cdot T_{\text{net}}(\tau) + \lambda_{\text{explore}} \cdot \mathbb{1}[\langle\texttt{backoff}\rangle \in \tau]$$
+$$r_{\text{prg}}(\mathbf{z}_j; \mathbf{c}_{j-1}) = J_r(\mu(\cdot \mid \mathbf{c}_j)) - J_r(\mu(\cdot \mid \mathbf{c}_{j-1}))$$
 
-where:
-- $r(\hat{a}, a^*) \in \{0, 1\}$ — correctness (exact match or pass@1)
-- $T_{\text{net}}(\tau)$ — **net** tokens in the final KV cache at termination (not total tokens ever generated). Backoff reclaims context, so deleted tokens don't count.
-- $\lambda_{\text{tok}} \geq 0$ — cost coefficient (small; we primarily optimize for correctness)
-- $\lambda_{\text{explore}} \geq 0$ — small bonus for using backoff at all (Phase 2 only). Without this, the model may never explore backoff and never discover it helps. Dropped in Phase 3 so backoff is only retained when it genuinely improves correctness.
+where $\mu$ is the meta-prover (the same model forced to answer immediately), $J_r$ is the expected 0/1 accuracy of that answer, and $\mathbf{c}_j$ is the KV cache state after segment $j$. With `num_probes=1` (greedy), $J_r \in \{0, 1\}$ and progress is in $\{-1, 0, +1\}$.
 
-Note: we penalize **net** tokens, not gross. Backoff is not penalized for the tokens it deletes — only for the directive and new content it adds.
+**Why this replaces token penalties and exploration bonuses.** The old reward used $\lambda_{\text{tok}} \cdot T_{\text{net}}$ (penalising length) and $\lambda_{\text{explore}} \cdot \mathbb{1}[\langle\texttt{backoff}\rangle \in \tau]$ (rewarding any backoff). Both are blunt instruments:
+- Token penalty punishes *length*, not *quality* — a long trace making steady progress is good.
+- Exploration bonus rewards backoff regardless of whether it helped.
+
+Progress reward subsumes both. Wasteful tokens show up as segments with zero or negative progress. Good backoffs show up as large positive progress (the meta-prover suddenly gets the right answer after context reclamation). Bad backoffs get penalised (undoing correct work). Token efficiency emerges *implicitly* — MRT found that progress optimisation reduces length without any explicit penalty.
+
+**Hyperparameters:**
+- $\alpha \geq 0$ — weight on progress signal (default: 0.5). Controls explore/exploit balance.
+- `num_probes` — meta-prover samples per prefix (default: 1, greedy). Higher values give smoother signal at higher compute cost.
 
 ---
 
@@ -380,51 +386,31 @@ These are learned in Phase 2-3 via RL.
 
 ---
 
-### Phase 2: GRPO with Exploration Bonus (encourage trying backoff)
+### Phase 2: GRPO with Progress Reward (learn optimal policy)
 
-**Goal:** Get the model to use backoff at a reasonable rate (10–30% of trajectories) so GRPO has enough signal to learn from.
+**Goal:** The model has learned the format (Phase 1) and can produce backoff trajectories. Now train with outcome reward + dense progress signal so every segment gets credit proportional to how much it helped.
 
-**Modified reward:**
+**Reward:**
 
-$$R_{\text{Phase 2}}(\tau) = \underbrace{r(\hat{a}, a^*)}_{\text{correctness}} - \underbrace{\lambda_{\text{tok}} \cdot T_{\text{net}}(\tau)}_{\text{token cost}} + \underbrace{\lambda_{\text{explore}} \cdot \mathbb{1}[\langle\texttt{backoff}\rangle \in \tau]}_{\text{exploration bonus}}$$
+$$R(\tau) = r(\hat{a}, a^*) + \alpha \sum_{j} r_{\text{prg}}(\mathbf{z}_j; \mathbf{c}_{j-1})$$
 
-The exploration bonus $\lambda_{\text{explore}} > 0$ gives a small reward for any trajectory that contains at least one backoff, regardless of whether backoff actually helped. This ensures backoff trajectories appear in rollouts and get compared against non-backoff trajectories.
+The progress signal replaces both the old token penalty and exploration bonus. Backoff is rewarded when it *actually helps* (positive progress after context reclamation) and penalised when it doesn't (undoing correct work). No separate exploration incentive is needed — the dense reward gives fine-grained credit to every action, including the first tentative backoffs.
 
-**Annealing schedule:** $\lambda_{\text{explore}}$ is annealed to 0 over training:
+**GRPO update:**
 
-$$\lambda_{\text{explore}}(t) = \lambda_{\text{explore}}^{(0)} \cdot \max\!\left(0,\; 1 - \frac{t}{T_{\text{anneal}}}\right)$$
+$$\hat{A}_i = \frac{R(\tau_i) - \mu_G}{\sigma_G}$$
 
-Once $\lambda_{\text{explore}} = 0$, the reward is purely outcome-based. If backoff genuinely helps accuracy, it survives. If not, the model naturally stops using it.
-
-**GRPO update:** Same as standard GRPO, but with $R_{\text{Phase 2}}$:
-
-$$\hat{A}_i = \frac{R_{\text{Phase 2}}(\tau_i) - \mu_G}{\sigma_G}$$
-
-**Transition criterion:** Move to Phase 3 when:
-- Backoff rate stabilizes between 10–50%
-- $\lambda_{\text{explore}}$ has reached 0 or near 0
-- Accuracy is improving or stable
-
----
-
-### Phase 3: Pure GRPO (learn optimal policy)
-
-**Goal:** The model has learned the format (Phase 1) and has tried backoff enough to know when it helps (Phase 2). Now optimize purely on outcome.
-
-**Reward (no exploration bonus):**
-
-$$R(\tau) = r(\hat{a}, a^*) - \lambda_{\text{tok}} \cdot T_{\text{net}}(\tau)$$
-
-Standard GRPO. The model refines:
+The model learns:
 - **When** to backoff (on what kinds of reasoning errors)
 - **How far** to rewind (optimal depth $d_t$)
 - **What directive** to write (corrective vs. strategic)
 - **When NOT** to backoff (on problems it can solve forward-only)
 
 **Convergence monitoring:**
-- Track backoff rate, accuracy, average $T_{\text{net}}$, depth distribution
+- Track backoff rate, accuracy, average progress, depth distribution
 - If backoff rate drops to $< 5\%$: backoff isn't useful for this model/benchmark (H1 fails)
 - If backoff rate stays $> 50\%$: model may be over-relying on backoff (check if accuracy is actually improving)
+- If average progress stays near zero despite correct answers: the model solves problems in one shot (good, backoff is correctly avoided)
 
 ---
 
@@ -433,15 +419,13 @@ Standard GRPO. The model refines:
 | Phase | Method | Reward | Purpose | Outcome |
 |-------|--------|--------|---------|---------|
 | 1 | SFT on synthetic data | Cross-entropy | Teach format + initialize embeddings | Model knows `<backoff>` syntax |
-| 2 | GRPO + $\lambda_{\text{explore}}$ | Correctness + exploration bonus | Encourage backoff exploration | Model tries backoff at 10–30% rate |
-| 3 | Pure GRPO | Correctness only | Learn optimal policy | Model uses backoff when it helps |
+| 2 | GRPO + progress | Correctness + $\alpha \sum r_{\text{prg}}$ | Learn optimal policy via dense signal | Model uses backoff when it helps |
 
-**SFT teaches syntax. GRPO teaches strategy.**
+**SFT teaches syntax. GRPO + progress teaches strategy.**
 
 ```
-Phase 1 (SFT):      "Here's what backoff looks like"
-Phase 2 (GRPO+bonus): "Try backoff — you get a bonus for exploring it"
-Phase 3 (Pure GRPO):  "Now figure out when it's actually worth doing"
+Phase 1 (SFT):          "Here's what backoff looks like"
+Phase 2 (GRPO+progress): "Every segment gets credit for how much it helped"
 ```
 
 ---

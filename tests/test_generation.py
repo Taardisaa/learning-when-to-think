@@ -38,7 +38,7 @@ class ForcedActionGenerator(BackoffGenerator):
         self._forced = forced_actions or []
         self._idx = 0
 
-    def _sample_masked(self, logits, allowed_ids, temperature):
+    def _sample_masked(self, logits, allowed_ids, temperature, generated_ids=None):
         if set(allowed_ids).issubset(set(self.action_ids)):
             if self._idx < len(self._forced):
                 forced = self._forced[self._idx]
@@ -50,7 +50,7 @@ class ForcedActionGenerator(BackoffGenerator):
                     masked = logits_flat + mask
                     lp = torch.nn.functional.log_softmax(masked, dim=-1)[forced].item()
                     return forced, lp
-        return super()._sample_masked(logits, allowed_ids, temperature)
+        return super()._sample_masked(logits, allowed_ids, temperature, generated_ids)
 
 
 # --- Cache mechanics ---
@@ -197,13 +197,15 @@ def test_build_forward_pass_sequences(setup):
     for s in seqs:
         assert s[:len(traj.prompt_ids)] == traj.prompt_ids
 
-    # Pass 1 should end with the backoff + depth tokens
+    # Pass 1 should end with the last directive token (directive is generated
+    # before truncation, so it's part of Pass 1 now)
     backoff_seg = [s for s in traj.segments if s.depth is not None][0]
-    assert seqs[0][-1] == backoff_seg.depth
-    assert seqs[0][-2] == backoff_seg.action  # <backoff>
+    assert seqs[0][-1] == backoff_seg.directive_ids[-1]
+    # <backoff> and depth should also be in Pass 1
+    assert backoff_seg.action in seqs[0]
+    assert backoff_seg.depth in seqs[0]
 
-    # Pass 2 should start with surviving prefix, then directive, then new chunk
-    # and end with </think>
+    # Pass 2 should end with </think>
     assert seqs[1][-1] == token_ids[TERMINATE_TOKEN]
 
 

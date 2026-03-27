@@ -63,16 +63,19 @@ class TrajectoryRecord:
             pass_tokens.append(seg.action)
 
             if seg.depth is not None:
-                # Backoff segment: close this pass with depth token
+                # Backoff: depth + directive are generated in the pre-truncation
+                # context (model sees the wrong tokens when writing the directive).
+                # All belong in this pass.
                 pass_tokens.append(seg.depth)
+                pass_tokens.extend(seg.directive_ids)
                 sequences.append(active + pass_tokens)
 
-                # After crop: active = everything up to rewind_pos
+                # After truncation: surviving prefix + directive re-injected
                 full_before_crop = active + pass_tokens
-                active = full_before_crop[:seg.rewind_pos]
+                active = full_before_crop[:seg.rewind_pos] + list(seg.directive_ids)
 
-                # Next pass starts with directive tokens
-                pass_tokens = list(seg.directive_ids)
+                # Next pass starts fresh (directive is now part of the prefix)
+                pass_tokens = []
 
         # Final pass (everything after last backoff, or the only pass)
         if pass_tokens:
@@ -139,6 +142,29 @@ def _restore_snapshot(cache, snapshot: _CacheSnapshot) -> torch.Tensor:
     return snapshot.logits
 
 
+def _clone_cache(cache) -> object:
+    """Deep-clone a Qwen3_5DynamicCache so each rollout gets an independent copy.
+
+    Clones all mutable state (KV tensors, conv/recurrent states) while
+    sharing the immutable metadata (layer_types, transformer_layers).
+    """
+    clone = object.__new__(type(cache))
+
+    # Immutable metadata — share references
+    clone.layer_types = cache.layer_types
+    clone.transformer_layers = cache.transformer_layers
+    clone.last_linear_layer = cache.last_linear_layer
+    # has_previous_state is a read-only property derived from conv_states
+
+    # Mutable state — deep clone
+    clone.key_cache = [k.clone() if k is not None else None for k in cache.key_cache]
+    clone.value_cache = [v.clone() if v is not None else None for v in cache.value_cache]
+    clone.conv_states = [c.clone() if c is not None else None for c in cache.conv_states]
+    clone.recurrent_states = [r.clone() if r is not None else None for r in cache.recurrent_states]
+
+    return clone
+
+
 # ── Generator ──
 
 
@@ -170,16 +196,33 @@ class BackoffGenerator:
         self.terminate_id = token_ids[TERMINATE_TOKEN]
 
     @torch.no_grad()
+    def prefill(self, prompt_ids: torch.Tensor) -> tuple:
+        """Prefill prompt and return a reusable (cache, logits) pair.
+
+        Call once per prompt, then use generate(..., prefill=...) for each
+        rollout. Each rollout deep-clones the cache, avoiding redundant
+        prefill forward passes.
+
+        Returns (cache, logits) — keep these and pass to generate().
+        """
+        out = self.model(prompt_ids, use_cache=True)
+        return out.past_key_values, out.logits[:, -1:, :]
+
+    @torch.no_grad()
     def generate(
         self,
         prompt_ids: torch.Tensor,
         temperature: float | None = None,
+        prefill: tuple | None = None,
     ) -> TrajectoryRecord:
         """Generate a trajectory with backoff-aware decisions.
 
         Args:
             prompt_ids: [1, seq_len] tensor of tokenized prompt.
             temperature: sampling temperature. None uses config default.
+            prefill: (cache, logits) from prefill(). If provided, the cache
+                is deep-cloned so each rollout is independent — saves one
+                full forward pass per rollout.
         """
         if temperature is None:
             temperature = self.config.temperature
@@ -187,10 +230,13 @@ class BackoffGenerator:
         prompt_list = prompt_ids[0].tolist()
         prompt_len = len(prompt_list)
 
-        # Prefill prompt → cache + logits for first generated token
-        out = self.model(prompt_ids, use_cache=True)
-        cache = out.past_key_values
-        next_logits = out.logits[:, -1:, :]  # [1, 1, vocab]
+        if prefill is not None:
+            cache = _clone_cache(prefill[0])
+            next_logits = prefill[1].clone()
+        else:
+            out = self.model(prompt_ids, use_cache=True)
+            cache = out.past_key_values
+            next_logits = out.logits[:, -1:, :]
 
         # State tracking
         full_sequence = list(prompt_list)  # all token IDs in the cache
@@ -215,7 +261,7 @@ class BackoffGenerator:
             chunk_log_prob = 0.0
 
             for _ in range(self.config.k_max):
-                token, lp = self._sample(next_logits, temperature)
+                token, lp = self._sample(next_logits, temperature, full_sequence)
                 chunk_ids.append(token)
                 chunk_log_prob += lp
                 total_generated += 1
@@ -257,7 +303,7 @@ class BackoffGenerator:
             if backoff_count >= self.config.b_max:
                 allowed = [a for a in allowed if a != self.backoff_id]
 
-            action, action_lp = self._sample_masked(next_logits, allowed, temperature)
+            action, action_lp = self._sample_masked(next_logits, allowed, temperature, full_sequence)
             total_generated += 1
             full_sequence.append(action)
 
@@ -278,42 +324,28 @@ class BackoffGenerator:
             elif action == self.backoff_id:
                 backoff_count += 1
 
-                # Sample depth token
+                # Sample depth token (model sees the wrong tokens)
                 depth, depth_lp = self._sample_masked(
-                    next_logits, self.depth_ids, temperature
+                    next_logits, self.depth_ids, temperature, full_sequence
                 )
                 total_generated += 1
                 full_sequence.append(depth)
 
-                # Compute rewind depth (1, 2, or 3)
-                depth_val = self.depth_ids.index(depth) + 1
-                depth_val = min(depth_val, len(boundaries) - 1)
+                # Feed depth token to model — still has wrong tokens in cache
+                depth_t = torch.tensor([[depth]], device=device)
+                out = self.model(depth_t, past_key_values=cache, use_cache=True)
+                next_logits = out.logits[:, -1:, :]
 
-                # Pop boundaries to find target
-                for _ in range(depth_val):
-                    popped = boundaries.pop()
-                    snapshots.pop(popped, None)
-                target_pos = boundaries[-1]
-
-                # Record segment (chunk + action + depth that will be deleted)
-                seg = Segment(
-                    chunk_ids=chunk_ids, action=action, depth=depth,
-                    kv_start_pos=chunk_start_pos, kv_end_pos=boundary_pos,
-                    rewind_pos=target_pos,
-                )
-                total_log_prob += chunk_log_prob + action_lp + depth_lp
-
-                # ── RESTORE snapshot (returns saved logits) ──
-                next_logits = _restore_snapshot(cache, snapshots[target_pos])
-                full_sequence = full_sequence[:target_pos]
-
-                # ── GENERATE DIRECTIVE ──
+                # ── GENERATE DIRECTIVE (before truncation) ──
+                # The directive is conditioned on the wrong tokens' hidden
+                # states, so the model can "see" what went wrong and write
+                # a specific correction (e.g., "26.53 is wrong, should be 27").
                 directive_ids: list[int] = []
                 directive_lp = 0.0
                 force_continued = False
 
                 for _ in range(self.config.k_dir):
-                    token, lp = self._sample(next_logits, temperature)
+                    token, lp = self._sample(next_logits, temperature, full_sequence)
                     directive_ids.append(token)
                     directive_lp += lp
                     total_generated += 1
@@ -332,13 +364,43 @@ class BackoffGenerator:
                     directive_ids.append(self.continue_id)
                     full_sequence.append(self.continue_id)
                     total_generated += 1
-                    cont_t = torch.tensor([[self.continue_id]], device=device)
-                    out = self.model(cont_t, past_key_values=cache, use_cache=True)
-                    next_logits = out.logits[:, -1:, :]
 
-                total_log_prob += directive_lp
-                seg.directive_ids = directive_ids
-                seg.force_continued = force_continued
+                # Compute rewind depth (1, 2, or 3)
+                depth_val = self.depth_ids.index(depth) + 1
+                depth_val = min(depth_val, len(boundaries) - 1)
+
+                # Pop boundaries to find target
+                for _ in range(depth_val):
+                    popped = boundaries.pop()
+                    snapshots.pop(popped, None)
+                target_pos = boundaries[-1]
+
+                # Record segment
+                seg = Segment(
+                    chunk_ids=chunk_ids, action=action, depth=depth,
+                    directive_ids=directive_ids,
+                    force_continued=force_continued,
+                    kv_start_pos=chunk_start_pos, kv_end_pos=boundary_pos,
+                    rewind_pos=target_pos,
+                )
+                total_log_prob += chunk_log_prob + action_lp + depth_lp + directive_lp
+
+                # ── NOW TRUNCATE: restore snapshot to rewind point ──
+                _restore_snapshot(cache, snapshots[target_pos])
+                full_sequence = full_sequence[:target_pos]
+
+                # ── RE-INJECT directive into the clean cache ──
+                # Feed directive tokens into the rewound cache so the
+                # continuation is conditioned on the correction.
+                directive_tensor = torch.tensor(
+                    [directive_ids], device=device
+                )
+                out = self.model(
+                    directive_tensor, past_key_values=cache, use_cache=True
+                )
+                next_logits = out.logits[:, -1:, :]
+                full_sequence.extend(directive_ids)
+
                 segments.append(seg)
                 boundary_tracker.reset()
 
@@ -398,8 +460,24 @@ class BackoffGenerator:
         for pos in dead:
             del snapshots[pos]
 
+    def _apply_repetition_penalty(
+        self, logits: torch.Tensor, generated_ids: list[int]
+    ) -> torch.Tensor:
+        """Apply repetition penalty to logits for previously generated tokens."""
+        penalty = self.config.repetition_penalty
+        if penalty == 1.0 or not generated_ids:
+            return logits
+        unique_ids = list(set(generated_ids))
+        token_logits = logits[unique_ids]
+        # Divide positive logits, multiply negative logits (standard HF convention)
+        logits[unique_ids] = torch.where(
+            token_logits > 0, token_logits / penalty, token_logits * penalty
+        )
+        return logits
+
     def _sample(
-        self, logits: torch.Tensor, temperature: float
+        self, logits: torch.Tensor, temperature: float,
+        generated_ids: list[int] | None = None,
     ) -> tuple[int, float]:
         """Sample from full vocab. Returns (token_id, log_prob_at_T1).
 
@@ -407,8 +485,12 @@ class BackoffGenerator:
         regardless of the sampling temperature.
         """
         logits = logits[0, -1, :]  # [vocab]
-        # Log-prob at T=1 for storage
+        # Log-prob at T=1 for storage (before repetition penalty)
         log_probs_t1 = F.log_softmax(logits, dim=-1)
+
+        # Apply repetition penalty for sampling only
+        if generated_ids is not None:
+            logits = self._apply_repetition_penalty(logits.clone(), generated_ids)
 
         if temperature <= 0:
             token = logits.argmax().item()
@@ -419,7 +501,8 @@ class BackoffGenerator:
         return token, log_probs_t1[token].item()
 
     def _sample_masked(
-        self, logits: torch.Tensor, allowed_ids: list[int], temperature: float
+        self, logits: torch.Tensor, allowed_ids: list[int], temperature: float,
+        generated_ids: list[int] | None = None,
     ) -> tuple[int, float]:
         """Sample from logits masked to allowed_ids only.
 
@@ -433,6 +516,10 @@ class BackoffGenerator:
 
         # Log-prob at T=1 under masked distribution
         log_probs_t1 = F.log_softmax(masked_logits, dim=-1)
+
+        # Apply repetition penalty for sampling only
+        if generated_ids is not None:
+            masked_logits = self._apply_repetition_penalty(masked_logits.clone(), generated_ids)
 
         if temperature <= 0:
             token = masked_logits.argmax().item()

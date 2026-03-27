@@ -23,9 +23,8 @@ class BackoffConfig:
     t_max: int = 2048 # max total tokens in trajectory
 
     # Reward
-    lambda_tok: float = 0.0001    # token cost coefficient
-    lambda_explore: float = 0.1   # exploration bonus (Phase 2, annealed)
-    anneal_steps: int = 500       # steps to anneal lambda_explore to 0
+    alpha: float = 0.5            # weight on dense progress signal
+    num_probes: int = 1           # meta-prover samples per prefix (1 = greedy)
 
     # GRPO
     num_rollouts: int = 4         # G — group size
@@ -43,6 +42,7 @@ class BackoffConfig:
     # Generation
     temperature: float = 0.7     # sampling temperature for rollouts
     eval_temperature: float = 0.0  # greedy for eval
+    repetition_penalty: float = 1.0  # 1.0 = disabled; baseline uses 1.3
 
     # System prompt used in chat template
     system_prompt: str = (
