@@ -186,6 +186,10 @@ def _build_passes(
             meta[base_pos + i] = "token"
         current_tokens.extend(seg.chunk_ids)
 
+        if seg.action is None:
+            # Auto-boundary segment — no action token to score
+            continue
+
         if seg.action == -1:
             # Partial segment (T_max reached) — no action to score
             continue
@@ -200,10 +204,7 @@ def _build_passes(
             # belong in this pass (with the wrong tokens still in context).
             for i, tok in enumerate(seg.directive_ids):
                 dir_pos = len(active_prefix) + len(current_tokens) + i
-                if seg.force_continued and i == len(seg.directive_ids) - 1:
-                    meta[dir_pos] = "skip"
-                else:
-                    meta[dir_pos] = "token"
+                meta[dir_pos] = "token"
             current_tokens.extend(seg.directive_ids)
 
             # Close this pass (includes chunk + action + directive)

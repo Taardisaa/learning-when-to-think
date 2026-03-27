@@ -29,10 +29,15 @@ def generate_rollouts(
     messages = [{"role": "user", "content": (
         f"{config.system_prompt}\n\n{question}"
     )}]
-    prompt_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
-        enable_thinking=True,
-    )
+    try:
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=True,
+        )
+    except TypeError:
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
     device = next(model.parameters()).device
     prompt_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(device)
 

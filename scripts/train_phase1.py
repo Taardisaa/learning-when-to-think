@@ -1,12 +1,12 @@
 """Phase 1: SFT warm-up — teach the model the backoff token format.
 
-Trains LoRA on Qwen3.5 with synthetic SFT data containing <continue>,
-<backoff_1/2/3>, and </think> tokens. New token embeddings are
+Trains LoRA on Qwen3 with synthetic SFT data containing
+<backoff_1/2/3> and </think> tokens. New token embeddings are
 selectively unfrozen via gradient masking.
 
 Usage:
     python -m scripts.train_phase1
-    python -m scripts.train_phase1 --model Qwen/Qwen3.5-0.8B --epochs 3
+    python -m scripts.train_phase1 --model Qwen/Qwen3-4B-Thinking-2507 --epochs 3
 """
 
 import argparse
@@ -40,7 +40,7 @@ def load_sft_data(path: str, tokenizer) -> Dataset:
 
 def main():
     parser = argparse.ArgumentParser(description="Phase 1: SFT warm-up")
-    parser.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
+    parser.add_argument("--model", default="Qwen/Qwen3-4B-Thinking-2507")
     parser.add_argument("--data", default="data/sft_train.jsonl")
     parser.add_argument("--output", default="checkpoints/phase1/final")
     parser.add_argument("--resume-from", default=None,
@@ -51,7 +51,7 @@ def main():
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--lora-r", type=int, default=16)
-    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--lora-alpha", type=int, default=16)
     args = parser.parse_args()
 
     print(f"Model:      {args.model}")

@@ -1,4 +1,4 @@
-"""Tests for segment-wise log-prob computation (Milestone 5).
+"""Tests for segment-wise log-prob computation.
 
 Verifies:
 1. 0-backoff trajectory: compute_trajectory_logprobs matches single forward pass
@@ -16,12 +16,14 @@ from src.tokens import setup_tokenizer_and_model, TERMINATE_TOKEN, ACTION_TOKENS
 from src.generation import BackoffGenerator, TrajectoryRecord
 from src.train.logprobs import compute_trajectory_logprobs, compute_batch_logprobs, _build_passes
 
+MODEL_NAME = "Qwen/Qwen3-4B-Thinking-2507"
+
 
 @pytest.fixture(scope="module")
 def setup():
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3.5-0.8B", dtype=torch.bfloat16, device_map="cuda"
+        MODEL_NAME, dtype=torch.bfloat16, device_map="cuda"
     )
     model.eval()
     token_ids = setup_tokenizer_and_model(tokenizer, model)
@@ -30,9 +32,14 @@ def setup():
 
 def _make_prompt(tokenizer, question):
     messages = [{"role": "user", "content": f"Solve the following math problem. Give the final answer after ####.\n\n{question}"}]
-    text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
-    )
+    try:
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
+        )
+    except TypeError:
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
     return tokenizer.encode(text, return_tensors="pt").to("cuda")
 
 
@@ -63,10 +70,10 @@ def test_zero_backoff_matches_single_pass(setup):
     model, tokenizer, token_ids = setup
     config = BackoffConfig(t_max=256, k_min=10, k_max=25, temperature=0.0)
 
-    # Force: continue, terminate (no backoff)
+    # Force: terminate (no backoff)
     gen = ForcedActionGenerator(
         model, tokenizer, token_ids, config,
-        forced_actions=[token_ids["<continue>"], token_ids[TERMINATE_TOKEN]],
+        forced_actions=[token_ids[TERMINATE_TOKEN]],
     )
 
     prompt_ids = _make_prompt(tokenizer, "What is 2+3?")
@@ -76,16 +83,15 @@ def test_zero_backoff_matches_single_pass(setup):
     assert traj.terminated
 
     # compute_trajectory_logprobs
-    computed_lp = compute_trajectory_logprobs(model, traj, token_ids, b_max=config.b_max)
+    computed_lp = compute_trajectory_logprobs(model, traj, token_ids)
 
     # Verify it's close to the stored log-prob from generation
-    # (Both should be at T=1, so they should match exactly for greedy)
     assert abs(computed_lp.item() - traj.stored_log_prob) < 0.5, (
         f"Mismatch: computed={computed_lp.item():.4f}, stored={traj.stored_log_prob:.4f}"
     )
 
     # Also verify single-pass construction
-    passes = _build_passes(traj, token_ids, config.b_max)
+    passes = _build_passes(traj, token_ids)
     assert len(passes) == 1, f"Expected 1 pass for 0-backoff, got {len(passes)}"
 
 
@@ -98,7 +104,6 @@ def test_one_backoff_has_two_passes(setup):
     gen = ForcedActionGenerator(
         model, tokenizer, token_ids, config,
         forced_actions=[
-            token_ids["<continue>"],
             token_ids["<backoff_1>"],
             token_ids[TERMINATE_TOKEN],
         ],
@@ -109,11 +114,10 @@ def test_one_backoff_has_two_passes(setup):
 
     assert traj.backoff_count == 1
 
-    passes = _build_passes(traj, token_ids, config.b_max)
+    passes = _build_passes(traj, token_ids)
     assert len(passes) == 2, f"Expected 2 passes, got {len(passes)}"
 
-    # Pass 1 should end with last directive token (directive generated
-    # before truncation, scored in pre-truncation context)
+    # Pass 1 should end with last directive token
     seq1, start1, meta1 = passes[0]
     backoff_seg = [s for s in traj.segments if s.rewind_pos is not None][0]
     assert seq1[-1] == backoff_seg.directive_ids[-1]
@@ -127,7 +131,7 @@ def test_one_backoff_has_two_passes(setup):
     assert seq2[-1] == token_ids[TERMINATE_TOKEN]
 
     # Compute log-probs — should be finite
-    lp = compute_trajectory_logprobs(model, traj, token_ids, b_max=config.b_max)
+    lp = compute_trajectory_logprobs(model, traj, token_ids)
     assert not torch.isnan(lp)
     assert not torch.isinf(lp)
     assert lp.item() < 0
@@ -150,7 +154,7 @@ def test_gradients_flow(setup):
 
     gen = ForcedActionGenerator(
         lora_model, tokenizer, token_ids, config,
-        forced_actions=[token_ids["<continue>"], token_ids[TERMINATE_TOKEN]],
+        forced_actions=[token_ids[TERMINATE_TOKEN]],
     )
     prompt_ids = _make_prompt(tokenizer, "What is 1+1?")
 
@@ -158,7 +162,7 @@ def test_gradients_flow(setup):
         traj = gen.generate(prompt_ids)
 
     # Compute log-probs WITH gradients
-    lp = compute_trajectory_logprobs(lora_model, traj, token_ids, b_max=config.b_max)
+    lp = compute_trajectory_logprobs(lora_model, traj, token_ids)
     lp.backward()
 
     # Check that LoRA weights have gradients
@@ -175,39 +179,7 @@ def test_gradients_flow(setup):
     lora_model.eval()
 
 
-# --- Test 4: Action masking respects b_max ---
-
-def test_action_masking_respects_b_max(setup):
-    model, tokenizer, token_ids = setup
-    config = BackoffConfig(t_max=512, k_min=10, k_max=25, temperature=0.0, k_dir=8, b_max=1)
-
-    gen = ForcedActionGenerator(
-        model, tokenizer, token_ids, config,
-        forced_actions=[
-            token_ids["<continue>"],
-            token_ids["<backoff_1>"],  # uses up b_max=1
-            # Next action: <backoff> should be masked
-        ],
-    )
-
-    prompt_ids = _make_prompt(tokenizer, "What is 8 * 9?")
-    traj = gen.generate(prompt_ids)
-
-    passes = _build_passes(traj, token_ids, b_max=1)
-
-    # Find action positions in pass 2 (after the backoff)
-    if len(passes) >= 2:
-        _, _, meta2 = passes[-1]
-        for key, val in meta2.items():
-            if isinstance(key, str) and key.startswith("allowed_"):
-                allowed = val
-                for bt in BACKOFF_TOKENS:
-                    assert token_ids[bt] not in allowed, (
-                        f"{bt} should be masked after b_max reached"
-                    )
-
-
-# --- Test 5: Batched log-probs match sequential ---
+# --- Test 4: Batched log-probs match sequential ---
 
 def test_batch_logprobs_matches_sequential(setup):
     """compute_batch_logprobs should produce the same values as calling
@@ -220,7 +192,7 @@ def test_batch_logprobs_matches_sequential(setup):
     for q in ["What is 2+3?", "What is 7*8?"]:
         gen = ForcedActionGenerator(
             model, tokenizer, token_ids, config,
-            forced_actions=[token_ids["<continue>"], token_ids[TERMINATE_TOKEN]],
+            forced_actions=[token_ids[TERMINATE_TOKEN]],
         )
         prompt_ids = _make_prompt(tokenizer, q)
         traj = gen.generate(prompt_ids)
@@ -228,12 +200,12 @@ def test_batch_logprobs_matches_sequential(setup):
 
     # Sequential
     seq_lps = [
-        compute_trajectory_logprobs(model, t, token_ids, b_max=config.b_max)
+        compute_trajectory_logprobs(model, t, token_ids)
         for t in trajs
     ]
 
     # Batched
-    batch_lps = compute_batch_logprobs(model, trajs, token_ids, b_max=config.b_max)
+    batch_lps = compute_batch_logprobs(model, trajs, token_ids)
 
     assert len(batch_lps) == len(seq_lps)
     for i, (s, b) in enumerate(zip(seq_lps, batch_lps)):
@@ -247,15 +219,14 @@ def test_batch_logprobs_with_backoff(setup):
     model, tokenizer, token_ids = setup
     config = BackoffConfig(t_max=512, k_min=10, k_max=25, temperature=0.0, k_dir=8)
 
-    # One with backoff, one without
+    # One without backoff, one with
     gen_no_backoff = ForcedActionGenerator(
         model, tokenizer, token_ids, config,
-        forced_actions=[token_ids["<continue>"], token_ids[TERMINATE_TOKEN]],
+        forced_actions=[token_ids[TERMINATE_TOKEN]],
     )
     gen_backoff = ForcedActionGenerator(
         model, tokenizer, token_ids, config,
         forced_actions=[
-            token_ids["<continue>"],
             token_ids["<backoff_1>"],
             token_ids[TERMINATE_TOKEN],
         ],
@@ -269,14 +240,12 @@ def test_batch_logprobs_with_backoff(setup):
     trajs = [traj1, traj2]
 
     seq_lps = [
-        compute_trajectory_logprobs(model, t, token_ids, b_max=config.b_max)
+        compute_trajectory_logprobs(model, t, token_ids)
         for t in trajs
     ]
-    batch_lps = compute_batch_logprobs(model, trajs, token_ids, b_max=config.b_max)
+    batch_lps = compute_batch_logprobs(model, trajs, token_ids)
 
     for i, (s, b) in enumerate(zip(seq_lps, batch_lps)):
-        # Tolerance accounts for numerical differences between batched
-        # and sequential forward passes (different CUDA kernel paths)
         assert abs(s.item() - b.item()) < 0.5, (
             f"Traj {i}: sequential={s.item():.4f}, batched={b.item():.4f}"
         )
@@ -297,7 +266,7 @@ def test_batch_logprobs_gradients_flow(setup):
 
     gen = ForcedActionGenerator(
         lora_model, tokenizer, token_ids, config,
-        forced_actions=[token_ids["<continue>"], token_ids[TERMINATE_TOKEN]],
+        forced_actions=[token_ids[TERMINATE_TOKEN]],
     )
     prompt_ids = _make_prompt(tokenizer, "What is 1+1?")
 
@@ -305,7 +274,7 @@ def test_batch_logprobs_gradients_flow(setup):
         traj = gen.generate(prompt_ids)
 
     batch_lps = compute_batch_logprobs(
-        lora_model, [traj], token_ids, b_max=config.b_max
+        lora_model, [traj], token_ids
     )
     batch_lps[0].backward()
 

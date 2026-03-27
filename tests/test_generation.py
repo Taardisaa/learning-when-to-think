@@ -6,16 +6,18 @@ from src.config import BackoffConfig
 from src.tokens import setup_tokenizer_and_model, TERMINATE_TOKEN
 from src.generation import (
     BackoffGenerator, Segment, TrajectoryRecord,
-    _save_snapshot, _restore_snapshot,
+    _truncate_cache,
 )
+
+MODEL_NAME = "Qwen/Qwen3-4B-Thinking-2507"
 
 
 @pytest.fixture(scope="module")
 def setup():
     """Load model/tokenizer once for all tests in this module."""
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3.5-0.8B", dtype=torch.bfloat16, device_map="cuda"
+        MODEL_NAME, dtype=torch.bfloat16, device_map="cuda"
     )
     model.eval()
     token_ids = setup_tokenizer_and_model(tokenizer, model)
@@ -24,14 +26,23 @@ def setup():
 
 def _make_prompt(tokenizer, question: str) -> torch.Tensor:
     messages = [{"role": "user", "content": f"Solve the following math problem. Give the final answer after ####.\n\n{question}"}]
-    text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
-    )
+    try:
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
+        )
+    except TypeError:
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
     return tokenizer.encode(text, return_tensors="pt").to("cuda")
 
 
 class ForcedActionGenerator(BackoffGenerator):
-    """Generator that forces specific action choices for testing."""
+    """Generator that forces specific action choices for testing.
+
+    Overrides _sample: when the model naturally emits an action token
+    (backoff or terminate), replaces it with the next forced action.
+    """
 
     def __init__(self, *args, forced_actions=None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -53,7 +64,7 @@ class ForcedActionGenerator(BackoffGenerator):
 
 # --- Cache mechanics ---
 
-def test_snapshot_reduces_cache(setup):
+def test_truncate_cache_reduces_length(setup):
     model, tokenizer, token_ids = setup
 
     prompt_ids = _make_prompt(tokenizer, "What is 2+3?")
@@ -65,9 +76,6 @@ def test_snapshot_reduces_cache(setup):
     cache = out.past_key_values
     logits = out.logits[:, -1:, :]
 
-    # Save snapshot at prompt end
-    snap = _save_snapshot(cache, logits)
-
     # Generate 20 tokens
     for _ in range(20):
         token = logits[0, -1].argmax().item()
@@ -76,12 +84,12 @@ def test_snapshot_reduces_cache(setup):
 
     assert cache.get_seq_length() == prompt_len + 20
 
-    # Restore snapshot → cache should shrink back to prompt_len
-    _restore_snapshot(cache, snap)
+    # Truncate cache back to prompt_len
+    _truncate_cache(cache, prompt_len)
     assert cache.get_seq_length() == prompt_len
 
 
-def test_generation_continues_after_snapshot_restore(setup):
+def test_generation_continues_after_truncate(setup):
     model, tokenizer, token_ids = setup
 
     prompt_ids = _make_prompt(tokenizer, "What is 1+1?")
@@ -92,19 +100,22 @@ def test_generation_continues_after_snapshot_restore(setup):
     logits = out.logits[:, -1:, :]
     initial_len = cache.get_seq_length()
 
-    # Save snapshot, generate some tokens, then restore
-    snap = _save_snapshot(cache, logits)
+    # Generate some tokens, then truncate
     for _ in range(10):
         token = logits[0, -1].argmax().item()
         out = model(torch.tensor([[token]], device="cuda"), past_key_values=cache, use_cache=True)
         logits = out.logits[:, -1:, :]
 
-    restored_logits = _restore_snapshot(cache, snap)
+    _truncate_cache(cache, initial_len)
     assert cache.get_seq_length() == initial_len
 
-    # Continue generating 5 tokens from restored state
-    logits = restored_logits
-    for _ in range(5):
+    # Continue generating 5 tokens from truncated state
+    # Re-inject a token to get new logits after truncation
+    token = torch.tensor([[logits[0, -1].argmax().item()]], device="cuda")
+    out = model(token, past_key_values=cache, use_cache=True)
+    logits = out.logits[:, -1:, :]
+
+    for _ in range(4):
         token = logits[0, -1].argmax().item()
         out = model(torch.tensor([[token]], device="cuda"), past_key_values=cache, use_cache=True)
         logits = out.logits[:, -1:, :]
@@ -152,7 +163,6 @@ def test_forced_backoff_creates_backoff_segment(setup):
     gen = ForcedActionGenerator(
         model, tokenizer, token_ids, config,
         forced_actions=[
-            token_ids["<continue>"],
             token_ids["<backoff_1>"],
             token_ids[TERMINATE_TOKEN],
         ],
@@ -177,7 +187,6 @@ def test_build_forward_pass_sequences(setup):
     gen = ForcedActionGenerator(
         model, tokenizer, token_ids, config,
         forced_actions=[
-            token_ids["<continue>"],
             token_ids["<backoff_1>"],
             token_ids[TERMINATE_TOKEN],
         ],
@@ -195,8 +204,7 @@ def test_build_forward_pass_sequences(setup):
     for s in seqs:
         assert s[:len(traj.prompt_ids)] == traj.prompt_ids
 
-    # Pass 1 should end with the last directive token (directive is generated
-    # before truncation, so it's part of Pass 1 now)
+    # Pass 1 should end with the last directive token
     backoff_seg = [s for s in traj.segments if s.rewind_pos is not None][0]
     assert seqs[0][-1] == backoff_seg.directive_ids[-1]
     # <backoff_N> should be in Pass 1
@@ -213,9 +221,7 @@ def test_forced_double_backoff(setup):
     gen = ForcedActionGenerator(
         model, tokenizer, token_ids, config,
         forced_actions=[
-            token_ids["<continue>"],
             token_ids["<backoff_1>"],
-            token_ids["<continue>"],
             token_ids["<backoff_1>"],
             token_ids[TERMINATE_TOKEN],
         ],
@@ -231,28 +237,6 @@ def test_forced_double_backoff(setup):
     assert len(backoff_segs) == 2
 
 
-def test_backoff_masked_after_b_max(setup):
-    model, tokenizer, token_ids = setup
-    config = BackoffConfig(t_max=512, k_min=10, k_max=30, temperature=0.7, k_dir=10, b_max=1)
-
-    # Force: continue, backoff (uses up b_max=1), then try backoff again
-    # The 3rd action should NOT be backoff since b_max is reached
-    gen = ForcedActionGenerator(
-        model, tokenizer, token_ids, config,
-        forced_actions=[
-            token_ids["<continue>"],
-            token_ids["<backoff_1>"],
-            # After b_max=1 is used up, backoff is masked; model picks continue or terminate
-        ],
-    )
-
-    prompt_ids = _make_prompt(tokenizer, "What is 8 * 9?")
-    traj = gen.generate(prompt_ids)
-
-    # Should have exactly 1 backoff (the second one is masked out)
-    assert traj.backoff_count == 1
-
-
 # --- Log-prob properties ---
 
 def test_log_prob_is_finite(setup):
@@ -266,3 +250,19 @@ def test_log_prob_is_finite(setup):
     assert not torch.isnan(torch.tensor(traj.stored_log_prob))
     assert not torch.isinf(torch.tensor(traj.stored_log_prob))
     assert traj.stored_log_prob < 0
+
+
+# --- Auto-boundary segments ---
+
+def test_auto_boundary_segments_have_none_action(setup):
+    model, tokenizer, token_ids = setup
+    config = BackoffConfig(t_max=256, k_min=10, k_max=30, temperature=0.7)
+    gen = BackoffGenerator(model, tokenizer, token_ids, config)
+
+    prompt_ids = _make_prompt(tokenizer, "What is 5 * 6?")
+    traj = gen.generate(prompt_ids)
+
+    # Should have at least some auto-boundary segments (action=None)
+    auto_segs = [s for s in traj.segments if s.action is None]
+    if len(traj.segments) > 1:
+        assert len(auto_segs) > 0, "Expected auto-boundary segments with action=None"

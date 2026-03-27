@@ -4,9 +4,9 @@ from dataclasses import dataclass, field
 @dataclass
 class BackoffConfig:
     # Model
-    model_name: str = "Qwen/Qwen3.5-0.8B"
+    model_name: str = "Qwen/Qwen3-4B"
     lora_r: int = 16
-    lora_alpha: int = 32
+    lora_alpha: int = 16
     lora_target_modules: list[str] = field(
         default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"]
     )

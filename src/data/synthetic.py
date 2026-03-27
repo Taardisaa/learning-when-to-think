@@ -203,18 +203,17 @@ def build_clean_example(
 
     Format:
         <think>
-        [step 1] <continue>
-        [step 2] <continue>
+        [step 1]
+        [step 2]
         ...
-        [final step] </think>
+        [final step]
+        </think>
         #### [answer]
     """
     parts = ["<think>"]
-    for i, step in enumerate(steps):
-        if i < len(steps) - 1:
-            parts.append(f"{step} <continue>")
-        else:
-            parts.append(f"{step} </think>")
+    for step in steps:
+        parts.append(step)
+    parts.append("</think>")
     parts.append(f"#### {answer}")
     return "\n".join(parts)
 
@@ -274,29 +273,27 @@ def build_backoff_example(
 
     # Correct steps before the error
     for i in range(error_start):
-        parts.append(f"{steps[i]} <continue>")
+        parts.append(steps[i])
 
-    # Wrong steps with <continue> between them
+    # Wrong steps
     for i, wrong in enumerate(wrong_steps):
         if i < len(wrong_steps) - 1:
-            parts.append(f"{wrong} <continue>")
+            parts.append(wrong)
         else:
-            # Last wrong step: followed by backoff
-            parts.append(f"{wrong} {backoff_token} {directive} <continue>")
+            # Last wrong step: followed by backoff + directive
+            parts.append(f"{wrong}\n{backoff_token} {directive}")
 
     # Correct continuation from the error point
     for i in range(error_start, len(steps)):
-        if i < len(steps) - 1:
-            parts.append(f"{steps[i]} <continue>")
-        else:
-            parts.append(f"{steps[i]} </think>")
+        parts.append(steps[i])
+    parts.append("</think>")
 
     parts.append(f"#### {answer}")
     return "\n".join(parts)
 
 
 def format_chat(question: str, assistant_content: str) -> list[dict]:
-    """Format as Qwen3.5 chat messages."""
+    """Format as Qwen3 chat messages."""
     return [
         {
             "role": "user",

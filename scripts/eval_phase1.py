@@ -1,11 +1,11 @@
 """Eval: generate on GSM8K test problems.
 
-With --no-adapter: uses standard model.generate() (no boundary tokens).
+With --no-adapter: uses standard model.generate() (no backoff tokens).
 With --checkpoint:  uses BackoffGenerator (boundary + backoff tokens).
 
 Usage:
-    python -m scripts.eval_phase1 --base-model Qwen/Qwen3.5-4B --no-adapter --n 500
-    python -m scripts.eval_phase1 --base-model Qwen/Qwen3.5-4B --checkpoint checkpoints/phase1_4B/final_fixed --n 500
+    python -m scripts.eval_phase1 --base-model Qwen/Qwen3-4B-Thinking-2507 --no-adapter --n 500
+    python -m scripts.eval_phase1 --base-model Qwen/Qwen3-4B-Thinking-2507 --checkpoint checkpoints/phase1_4B/final --n 500
 """
 
 import argparse
@@ -40,7 +40,7 @@ def _generate_raw(model, tokenizer, prompt_ids, t_max):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--base-model", default="Qwen/Qwen3.5-0.8B")
+    parser.add_argument("--base-model", default="Qwen/Qwen3-4B-Thinking-2507")
     parser.add_argument("--no-adapter", action="store_true",
                         help="Evaluate base model with standard generate (no boundary tokens)")
     parser.add_argument("--n", type=int, default=10, help="Number of test problems")
@@ -74,7 +74,7 @@ def main():
     token_ids = None
     id2name = {}
     if not use_raw:
-        from src.tokens import NEW_SPECIAL_TOKENS, ACTION_TOKENS, BACKOFF_TOKENS
+        from src.tokens import NEW_SPECIAL_TOKENS, BACKOFF_TOKENS
         all_special = NEW_SPECIAL_TOKENS + [TERMINATE_TOKEN]
         token_ids = {tok: tokenizer.convert_tokens_to_ids(tok) for tok in all_special}
         print(f"Token IDs: {token_ids}")
@@ -90,7 +90,7 @@ def main():
 
     correct = 0
     total_backoffs = 0
-    total_continues = 0
+    total_segments = 0
     total_terminates = 0
 
     for i, ex in enumerate(data):
@@ -98,10 +98,15 @@ def main():
             f"Solve the following math problem. "
             f"Give the final answer after ####.\n\n{ex['question']}"
         )}]
-        prompt_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-            enable_thinking=True,
-        )
+        try:
+            prompt_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=True,
+            )
+        except TypeError:
+            prompt_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
         prompt_ids = tokenizer.encode(prompt_text, return_tensors="pt").to("cuda")
 
         if use_raw:
@@ -121,10 +126,9 @@ def main():
             # BackoffGenerator for SFT'd model
             traj = gen.generate(prompt_ids)
 
-            n_continue = sum(1 for s in traj.segments if s.action == token_ids["<continue>"])
             n_backoff = traj.backoff_count
             n_terminate = 1 if traj.terminated else 0
-            total_continues += n_continue
+            total_segments += len(traj.segments)
             total_backoffs += n_backoff
             total_terminates += n_terminate
 
@@ -137,11 +141,14 @@ def main():
             print(f"Gold: {ex['answer_number']}  Predicted: {traj.answer_number}  "
                   f"{'OK' if is_correct else 'WRONG'}")
             print(f"Segments: {len(traj.segments)}  "
-                  f"<continue>: {n_continue}  <backoff>: {n_backoff}  "
+                  f"<backoff>: {n_backoff}  "
                   f"terminated: {traj.terminated}  gen_tokens: {traj.total_generated_tokens}")
 
             for j, seg in enumerate(traj.segments):
-                action_name = id2name.get(seg.action, str(seg.action))
+                if seg.action is None:
+                    action_name = "boundary"
+                else:
+                    action_name = id2name.get(seg.action, str(seg.action))
                 chunk_text = tokenizer.decode(seg.chunk_ids)
                 print(f"  Seg {j}: [{action_name}] {chunk_text}")
                 if seg.directive_ids:
@@ -156,7 +163,7 @@ def main():
     print(f"{'='*70}")
     print(f"Accuracy:     {correct}/{args.n} ({100*correct/args.n:.0f}%)")
     if not use_raw:
-        print(f"<continue>:   {total_continues} total ({total_continues/args.n:.1f}/problem)")
+        print(f"Segments:     {total_segments} total ({total_segments/args.n:.1f}/problem)")
         print(f"<backoff>:    {total_backoffs} total ({total_backoffs/args.n:.1f}/problem)")
         print(f"Terminated:   {total_terminates}/{args.n}")
 

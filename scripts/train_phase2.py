@@ -59,7 +59,7 @@ def load_phase1_as_base(base_model_name: str, phase1_path: str, device: str = "c
 
 def main():
     parser = argparse.ArgumentParser(description="Phase 2: GRPO + exploration")
-    parser.add_argument("--base-model", default="Qwen/Qwen3.5-0.8B")
+    parser.add_argument("--base-model", default="Qwen/Qwen3-4B-Thinking-2507")
     parser.add_argument("--phase1", default="checkpoints/phase1/final")
     parser.add_argument("--output", default="checkpoints/phase2")
     parser.add_argument("--steps", type=int, default=500)

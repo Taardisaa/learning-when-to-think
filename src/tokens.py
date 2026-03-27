@@ -1,21 +1,20 @@
 import torch
 from transformers import PreTrainedTokenizerBase, PreTrainedModel
 
-# The 4 new special tokens we add to the vocabulary.
-# <terminate> is NOT added — it reuses the existing </think> (id 248069 in Qwen3.5).
+# The 3 new special tokens we add to the vocabulary.
+# </think> is NOT added — it reuses the existing token in the Qwen vocab.
 # Backoff tokens encode both the action and rewind depth in a single token.
+# <continue> has been removed — boundaries are detected heuristically.
 NEW_SPECIAL_TOKENS = [
-    "<continue>",
     "<backoff_1>",
     "<backoff_2>",
     "<backoff_3>",
 ]
 
-TERMINATE_TOKEN = "</think>"  # already in Qwen3.5 vocab
-TERMINATE_TOKEN_ID = 248069
+TERMINATE_TOKEN = "</think>"  # already in Qwen3 vocab
 
-# All tokens the model can emit at decision points
-ACTION_TOKENS = ["<continue>", "<backoff_1>", "<backoff_2>", "<backoff_3>", TERMINATE_TOKEN]
+# All action tokens the model can emit (backoff or terminate)
+ACTION_TOKENS = ["<backoff_1>", "<backoff_2>", "<backoff_3>", TERMINATE_TOKEN]
 BACKOFF_TOKENS = ["<backoff_1>", "<backoff_2>", "<backoff_3>"]
 
 
@@ -64,14 +63,14 @@ def setup_tokenizer_and_model(
     all_special = NEW_SPECIAL_TOKENS + [TERMINATE_TOKEN]
     token_ids = {tok: tokenizer.convert_tokens_to_ids(tok) for tok in all_special}
 
-    # Verify </think> is at the expected ID
-    assert token_ids[TERMINATE_TOKEN] == TERMINATE_TOKEN_ID, (
-        f"Expected </think> at id {TERMINATE_TOKEN_ID}, "
-        f"got {token_ids[TERMINATE_TOKEN]}"
+    # Verify </think> exists in vocab (don't hardcode the ID — it varies by model)
+    terminate_id = token_ids[TERMINATE_TOKEN]
+    unk_id = tokenizer.unk_token_id
+    assert terminate_id != unk_id, (
+        f"</think> mapped to UNK ({unk_id}) — model may not support thinking tokens"
     )
 
     # Verify new tokens got valid (non-UNK) IDs
-    unk_id = tokenizer.unk_token_id
     for tok in NEW_SPECIAL_TOKENS:
         assert token_ids[tok] != unk_id, f"Token {tok} mapped to UNK"
 

@@ -6,18 +6,19 @@ from peft import LoraConfig, get_peft_model
 from src.tokens import (
     NEW_SPECIAL_TOKENS,
     TERMINATE_TOKEN,
-    TERMINATE_TOKEN_ID,
     ACTION_TOKENS,
     BACKOFF_TOKENS,
     setup_tokenizer_and_model,
     enable_new_token_grad,
 )
 
+MODEL_NAME = "Qwen/Qwen3-4B-Thinking-2507"
+
 
 def _load():
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3.5-0.8B", dtype=torch.bfloat16, device_map="cpu"
+        MODEL_NAME, dtype=torch.bfloat16, device_map="cpu"
     )
     return tokenizer, model
 
@@ -26,15 +27,15 @@ def test_setup_returns_all_token_ids():
     tokenizer, model = _load()
     token_ids = setup_tokenizer_and_model(tokenizer, model)
 
-    # Should have entries for all 5 new tokens + </think>
+    # Should have entries for all new tokens + </think>
     expected = set(NEW_SPECIAL_TOKENS + [TERMINATE_TOKEN])
     assert set(token_ids.keys()) == expected
 
 
-def test_terminate_token_id():
+def test_terminate_token_not_unk():
     tokenizer, model = _load()
     token_ids = setup_tokenizer_and_model(tokenizer, model)
-    assert token_ids[TERMINATE_TOKEN] == TERMINATE_TOKEN_ID
+    assert token_ids[TERMINATE_TOKEN] != tokenizer.unk_token_id
 
 
 def test_new_tokens_get_unique_ids():
@@ -45,7 +46,7 @@ def test_new_tokens_get_unique_ids():
     # All unique
     assert len(set(new_ids)) == len(new_ids)
     # None equal to </think>
-    assert TERMINATE_TOKEN_ID not in new_ids
+    assert token_ids[TERMINATE_TOKEN] not in new_ids
 
 
 def test_embeddings_resized():
@@ -69,11 +70,11 @@ def test_new_embeddings_not_zero():
 
 
 def test_action_and_backoff_groups():
-    assert "<continue>" in ACTION_TOKENS
     assert "<backoff_1>" in ACTION_TOKENS
     assert "<backoff_2>" in ACTION_TOKENS
     assert "<backoff_3>" in ACTION_TOKENS
     assert TERMINATE_TOKEN in ACTION_TOKENS
+    assert "<continue>" not in ACTION_TOKENS
     assert len(BACKOFF_TOKENS) == 3
 
 
@@ -92,7 +93,7 @@ def test_enable_new_token_grad_masks_pretrained():
     token_ids = setup_tokenizer_and_model(tokenizer, model)
 
     lora = LoraConfig(
-        r=16, lora_alpha=32,
+        r=16, lora_alpha=16,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         task_type="CAUSAL_LM",
     )
@@ -100,7 +101,7 @@ def test_enable_new_token_grad_masks_pretrained():
     hooks = enable_new_token_grad(model, token_ids)
 
     # Forward + backward with a new token in input
-    new_tok_id = token_ids["<continue>"]
+    new_tok_id = token_ids["<backoff_1>"]
     input_ids = tokenizer("test", return_tensors="pt").input_ids
     input_ids = torch.cat([input_ids, torch.tensor([[new_tok_id]])], dim=1)
     out = model(input_ids=input_ids, labels=input_ids.clone())

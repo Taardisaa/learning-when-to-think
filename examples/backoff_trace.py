@@ -1,8 +1,7 @@
 """Concrete running example of the backoff generation loop.
 
 Shows how cache truncation works step by step:
-- Forces a specific token sequence (continue → backoff_1 → continue → terminate)
-- Prints the full trace: chunk text, actions, cache positions, snapshot restore
+- Prints the full trace: chunk text, actions, cache positions, boundary detection
 - Shows the forward pass sequences used for segment-wise log-prob in GRPO
 
 Usage:
@@ -19,9 +18,9 @@ from src.generation import BackoffGenerator
 
 def main():
     print("Loading model...")
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B-Thinking-2507")
     model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3.5-0.8B", dtype=torch.bfloat16, device_map="cuda"
+        "Qwen/Qwen3-4B-Thinking-2507", dtype=torch.bfloat16, device_map="cuda"
     )
     model.eval()
     token_ids = setup_tokenizer_and_model(tokenizer, model)
@@ -38,9 +37,14 @@ def main():
             f"Give the final answer after ####.\n\n{question}"
         )}
     ]
-    prompt_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
-    )
+    try:
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
+        )
+    except TypeError:
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
     prompt_ids = tokenizer.encode(prompt_text, return_tensors="pt").to("cuda")
     prompt_len = prompt_ids.shape[1]
 
@@ -56,7 +60,10 @@ def main():
     print(f"\nPrompt ({prompt_len} tokens): {tokenizer.decode(prompt_ids[0])}")
 
     for i, seg in enumerate(traj.segments):
-        action_name = id2name.get(seg.action, str(seg.action))
+        if seg.action is None:
+            action_name = "boundary"
+        else:
+            action_name = id2name.get(seg.action, str(seg.action))
         print(f"\n{'─' * 80}")
         print(f"SEGMENT {i}")
         print(f"{'─' * 80}")
@@ -66,7 +73,7 @@ def main():
         print(f"    \"{chunk_text}\"")
         print(f"  Action: {action_name}")
 
-        if seg.action in backoff_id_set:
+        if seg.action is not None and seg.action in backoff_id_set:
             depth_val = BACKOFF_TOKENS.index(action_name) + 1 if action_name in BACKOFF_TOKENS else "?"
             print(f"  Rewind depth: {depth_val} boundary(ies)")
             print(f"  Rewind target: position {seg.rewind_pos}")
@@ -82,12 +89,10 @@ def main():
             dir_text = tokenizer.decode(seg.directive_ids)
             print(f"  │  DIRECTIVE ({len(seg.directive_ids)} tokens): "
                   f"\"{dir_text}\"")
-            if seg.force_continued:
-                print(f"  │  (force-appended <continue>)")
             print(f"  └─ AFTER DIRECTIVE: cache has "
                   f"{seg.rewind_pos + len(seg.directive_ids)} tokens")
         else:
-            print(f"  Cache after action: {seg.kv_end_pos + 1} tokens")
+            print(f"  Cache after: {seg.kv_end_pos} tokens")
 
     print(f"\n{'─' * 80}")
     print(f"ANSWER")

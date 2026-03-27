@@ -13,50 +13,43 @@ import torch
 import torch.nn.functional as F
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
+from src.boundary import BoundaryTracker
 from src.config import BackoffConfig
 from src.data.gsm8k import extract_predicted_number
 from src.generation import (
     Segment,
     TrajectoryRecord,
     BackoffGenerator,
-    _save_snapshot,
-    _restore_snapshot,
-    _CacheSnapshot,
+    _truncate_cache,
+    _clone_cache,
 )
 from src.tokens import ACTION_TOKENS, BACKOFF_TOKENS, TERMINATE_TOKEN
 
 
 def _expand_cache_batch(cache, G: int):
     """Expand a batch=1 cache to batch=G by repeating along dim 0."""
-    for i, ltype in enumerate(cache.layer_types):
-        if ltype == "full_attention":
-            cache.key_cache[i] = cache.key_cache[i].expand(G, -1, -1, -1).contiguous()
-            cache.value_cache[i] = cache.value_cache[i].expand(G, -1, -1, -1).contiguous()
-        else:
-            cache.conv_states[i] = cache.conv_states[i].expand(G, -1, -1).contiguous()
-            cache.recurrent_states[i] = cache.recurrent_states[i].expand(G, -1, -1, -1).contiguous()
+    for i in range(len(cache.key_cache)):
+        cache.key_cache[i] = cache.key_cache[i].expand(G, -1, -1, -1).contiguous()
+        cache.value_cache[i] = cache.value_cache[i].expand(G, -1, -1, -1).contiguous()
 
 
 def _extract_single_cache(cache, idx: int):
     """Extract a single-batch cache for rollout idx (for backoff fallback)."""
-    from src.generation import _clone_cache
-    clone = _clone_cache(cache)
-    for i, ltype in enumerate(clone.layer_types):
-        if ltype == "full_attention":
-            clone.key_cache[i] = clone.key_cache[i][idx:idx+1].clone()
-            clone.value_cache[i] = clone.value_cache[i][idx:idx+1].clone()
-        else:
-            clone.conv_states[i] = clone.conv_states[i][idx:idx+1].clone()
-            clone.recurrent_states[i] = clone.recurrent_states[i][idx:idx+1].clone()
+    from transformers import DynamicCache
+
+    clone = DynamicCache()
+    for i in range(len(cache.key_cache)):
+        clone.key_cache.append(cache.key_cache[i][idx:idx+1].clone())
+        clone.value_cache.append(cache.value_cache[i][idx:idx+1].clone())
     return clone
 
 
 class BatchedBackoffGenerator:
     """Batched generation: G rollouts per forward pass.
 
-    Free token-by-token generation — the model decides when to emit
-    <continue>, <backoff_N>, or </think>. Special tokens are detected
-    in the stream and handled reactively.
+    Free token-by-token generation — the model generates freely.
+    Boundaries are detected heuristically by BoundaryTracker. When
+    <backoff_N> or </think> appears in the stream, we handle it.
 
     Rollouts that terminate get their answers generated individually.
     Rollouts that back off fall back to the sequential BackoffGenerator.
@@ -77,7 +70,6 @@ class BatchedBackoffGenerator:
         self.action_ids = [token_ids[t] for t in ACTION_TOKENS]
         self.backoff_ids = [token_ids[t] for t in BACKOFF_TOKENS]
         self.backoff_id_set = set(self.backoff_ids)
-        self.continue_id = token_ids["<continue>"]
         self.terminate_id = token_ids[TERMINATE_TOKEN]
 
         # Sequential fallback for backoff/answer
@@ -113,7 +105,7 @@ class BatchedBackoffGenerator:
         next_logits = out.logits[:, -1:, :].expand(G, -1, -1).contiguous()
 
         # ── Per-rollout state ──
-        states = [_RolloutState(prompt_list) for _ in range(G)]
+        states = [_RolloutState(prompt_list, self.config) for _ in range(G)]
         active = [True] * G  # still generating
         results: list[TrajectoryRecord | None] = [None] * G
 
@@ -136,11 +128,7 @@ class BatchedBackoffGenerator:
                 s.total_generated += 1
                 s.full_sequence.append(token)
 
-                if token == self.continue_id:
-                    # Boundary — finish segment, start new chunk
-                    s.finish_segment(token, lp)
-
-                elif token in self.backoff_id_set:
+                if token in self.backoff_id_set:
                     # Pull out of batch, handle individually
                     s.action_lp = lp
                     s.current_action = token
@@ -165,6 +153,11 @@ class BatchedBackoffGenerator:
                     # Regular token — accumulate into chunk
                     s.chunk_ids.append(token)
                     s.chunk_log_prob += lp
+
+                    # Check for heuristic boundary
+                    token_text = self.tokenizer.decode([token])
+                    if s.boundary_tracker.step(token_text):
+                        s.finish_segment(None, 0.0)  # auto-boundary
 
                 tokens.append(token)
 
@@ -252,7 +245,6 @@ class BatchedBackoffGenerator:
         # ── 2. Generate directive (up to k_dir tokens) ──
         directive_ids: list[int] = []
         directive_lp = 0.0
-        force_continued = False
 
         for _ in range(self.config.k_dir):
             token, lp = self._seq_gen._sample(dir_logits, temperature, state.full_sequence)
@@ -265,14 +257,10 @@ class BatchedBackoffGenerator:
             out = self.model(token_t, past_key_values=single_cache, use_cache=True)
             dir_logits = out.logits
 
-            if token == self.continue_id:
+            # Stop at newline
+            d_text = self._seq_gen.tokenizer.decode([token])
+            if "\n" in d_text and len(directive_ids) > 1:
                 break
-
-        if not directive_ids or directive_ids[-1] != self.continue_id:
-            force_continued = True
-            directive_ids.append(self.continue_id)
-            state.full_sequence.append(self.continue_id)
-            state.total_generated += 1
 
         # ── 3. Compute rewind target ──
         boundaries = [state.prompt_len]
@@ -294,7 +282,6 @@ class BatchedBackoffGenerator:
             chunk_ids=list(state.chunk_ids),
             action=backoff_action,
             directive_ids=directive_ids,
-            force_continued=force_continued,
             kv_start_pos=state.chunk_start_pos,
             kv_end_pos=current_boundary,
             rewind_pos=target_pos,
@@ -339,13 +326,16 @@ class BatchedBackoffGenerator:
 class _RolloutState:
     """Mutable per-rollout state for batched generation."""
 
-    def __init__(self, prompt_list: list[int]):
+    def __init__(self, prompt_list: list[int], config: BackoffConfig):
         self.full_sequence = list(prompt_list)
         self.prompt_len = len(prompt_list)
         self.segments: list[Segment] = []
         self.backoff_count = 0
         self.total_generated = 0
         self.total_log_prob = 0.0
+
+        # Boundary tracking
+        self.boundary_tracker = BoundaryTracker(config.k_min, config.k_max)
 
         # Current chunk being built
         self.chunk_ids: list[int] = []
@@ -356,7 +346,7 @@ class _RolloutState:
         self.action_lp = 0.0
         self.current_action = -1
 
-    def finish_segment(self, action: int, action_lp: float):
+    def finish_segment(self, action: int | None, action_lp: float):
         """Close the current chunk as a segment."""
         boundary_pos = self.chunk_start_pos + len(self.chunk_ids)
         self.segments.append(Segment(
@@ -372,3 +362,4 @@ class _RolloutState:
         self.chunk_log_prob = 0.0
         self.chunk_start_pos = len(self.full_sequence)
         self.action_lp = 0.0
+        self.boundary_tracker.reset()
