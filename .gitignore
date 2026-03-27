@@ -46,3 +46,5 @@ Thumbs.db
 
 checkpoints/
 /data/
+baselines/*
+eval_results/*

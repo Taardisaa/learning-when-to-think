@@ -31,15 +31,8 @@ def setup():
 
 
 def _make_prompt(tokenizer, question):
-    messages = [{"role": "user", "content": f"Solve the following math problem. Please reason step by step, and put your final answer within \\boxed{}.\n\n{question}"}]
-    try:
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
-        )
-    except TypeError:
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+    from src.prompt import build_prompt
+    text = build_prompt(tokenizer, question)
     return tokenizer.encode(text, return_tensors="pt").to("cuda")
 
 

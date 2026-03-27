@@ -18,6 +18,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.config import BackoffConfig
 from src.data.gsm8k import load_gsm8k, extract_predicted_number
+from src.prompt import build_prompt
 from src.tokens import setup_tokenizer_and_model, TERMINATE_TOKEN
 from src.generation import BackoffGenerator
 
@@ -110,20 +111,7 @@ def main():
     results = []
 
     for i, ex in enumerate(data):
-        messages = [{"role": "user", "content": (
-            f"Solve the following math problem. "
-            f"Please reason step by step, and put your final answer "
-            f"within \\boxed{{}}.\n\n{ex['question']}"
-        )}]
-        try:
-            prompt_text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=True,
-            )
-        except TypeError:
-            prompt_text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
+        prompt_text = build_prompt(tokenizer, ex["question"])
         prompt_ids = tokenizer.encode(prompt_text, return_tensors="pt").to("cuda")
 
         if use_raw:

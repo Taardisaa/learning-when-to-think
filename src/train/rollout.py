@@ -8,6 +8,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 from src.config import BackoffConfig
 from src.generation import TrajectoryRecord
 from src.generation_batched import BatchedBackoffGenerator
+from src.prompt import build_prompt
 
 
 @torch.no_grad()
@@ -26,18 +27,7 @@ def generate_rollouts(
     """
     gen = BatchedBackoffGenerator(model, tokenizer, token_ids, config)
 
-    messages = [{"role": "user", "content": (
-        f"{config.system_prompt}\n\n{question}"
-    )}]
-    try:
-        prompt_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-            enable_thinking=True,
-        )
-    except TypeError:
-        prompt_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
+    prompt_text = build_prompt(tokenizer, question, config.system_prompt)
     device = next(model.parameters()).device
     prompt_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(device)
 

@@ -12,6 +12,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.config import BackoffConfig
+from src.prompt import build_prompt
 from src.tokens import setup_tokenizer_and_model, TERMINATE_TOKEN, BACKOFF_TOKENS
 from src.generation import BackoffGenerator
 
@@ -31,20 +32,7 @@ def main():
     gen = BackoffGenerator(model, tokenizer, token_ids, config)
 
     question = "What is 15 + 27?"
-    messages = [
-        {"role": "user", "content": (
-            f"Solve the following math problem. "
-            f"Please reason step by step, and put your final answer within \\boxed{}.\n\n{question}"
-        )}
-    ]
-    try:
-        prompt_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
-        )
-    except TypeError:
-        prompt_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+    prompt_text = build_prompt(tokenizer, question)
     prompt_ids = tokenizer.encode(prompt_text, return_tensors="pt").to("cuda")
     prompt_len = prompt_ids.shape[1]
 
