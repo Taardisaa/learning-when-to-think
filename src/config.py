@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 @dataclass
 class BackoffConfig:
     # Model
-    model_name: str = "Qwen/Qwen3-4B"
+    model_name: str = "Qwen/Qwen3-1.7B"
     lora_r: int = 16
     lora_alpha: int = 16
     lora_target_modules: list[str] = field(

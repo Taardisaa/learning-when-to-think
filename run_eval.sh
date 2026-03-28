@@ -5,6 +5,21 @@ CUDA_VISIBLE_DEVICES=0 ./venv/bin/python -m scripts.eval_phase1 --base-model Qwe
 PYTHONPATH=. torchrun --nproc_per_node 2 scripts/train_phase1.py --model Qwen/Qwen3-4B-Thinking-2507 --output checkpoints/phase1_4B/final --epochs 1
 
 
+
+# Thinking enabled.
+PYTHONPATH=. ./venv/bin/python -m scripts.eval_math500 --model Qwen/Qwen3-1.7B --n 500 --tp 2
+
+PYTHONPATH=. ./venv/bin/python -m scripts.eval_math500 --model Qwen/Qwen3-1.7B-Base --n 500 --tp 2
+
+# 
+PYTHONPATH=. ./venv/bin/python scripts/generate_sft_real_backoff.py --model Qwen/Qwen3-1.7B --dataset math --num-samples 8 --tp 2
+
+# 
+PYTHONPATH=. ./venv/bin/python scripts/generate_sft_real_backoff.py --rollouts data/rollouts_grouped_math_Qwen3-1.7B.jsonl --output data/sft_real_backoff_math_train.jsonl
+
+# Stale!!!
+
+
 PYTHONPATH=. ./venv/bin/python scripts/generate_sft_data.py --backoff-ratio 0.75
 
 # Baseline (max token is 8192)

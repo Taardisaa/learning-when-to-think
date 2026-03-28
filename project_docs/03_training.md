@@ -7,15 +7,15 @@ Standard GRPO (DeepSeek-R1 style) assumes a trajectory is a left-to-right token 
 Backoff breaks this assumption. A trajectory with one backoff event:
 
 ```
-x → [chunk1] → <continue> → [chunk2] → <backoff> → [directive] → [chunk3] → <terminate>
-                              ^^^^^^^^
-                              DELETED from KV cache after backoff
+x → [chunk1] → [chunk2] → <backoff_2> → [directive] → [chunk3] → </think>
+                ^^^^^^^^
+                DELETED from KV cache after backoff
 ```
 
 After truncation, the KV cache state is:
 
 ```
-x → [chunk1] → [directive] → [chunk3] → <terminate>
+x → [chunk1] → [directive] → [chunk3] → </think>
 ```
 
 `chunk3` was generated conditioned on `x + chunk1 + directive`, **not** on `x + chunk1 + chunk2 + ...`. A single left-to-right forward pass over the full generated token sequence would give incorrect log-probabilities for everything after the backoff.
@@ -28,13 +28,13 @@ Split the trajectory at each backoff event. Compute log-probabilities with separ
 
 **For a trajectory with one backoff:**
 
-**Pass 1 (pre-backoff context):** `x + chunk1 + <continue> + chunk2 + <backoff> + directive`
+**Pass 1 (pre-backoff context):** `x + chunk1 + chunk2 + <backoff_N> + directive`
 
 Collect $\log p_\theta(y_j \mid y_{<j})$ for all tokens in this segment.
 
-**Pass 2 (post-backoff context):** `x + chunk1 + directive + chunk3 + <terminate>`
+**Pass 2 (post-backoff context):** `x + chunk1 + directive + chunk3 + </think>`
 
-Collect $\log p_\theta(y_j \mid y_{<j}^{\text{trunc}})$ for `chunk3` and `<terminate>` only. The prefix `x + chunk1 + directive` provides the KV cache state that the model actually had when generating `chunk3`.
+Collect $\log p_\theta(y_j \mid y_{<j}^{\text{trunc}})$ for `chunk3` and `</think>` only. The prefix `x + chunk1 + directive` provides the KV cache state that the model actually had when generating `chunk3`.
 
 **Full trajectory log-probability:**
 
@@ -78,15 +78,15 @@ The gradient flows through **all** decisions in the trajectory:
 | Decision | Gradient signal |
 |----------|----------------|
 | Generating chunk1 tokens | "Was this reasoning helpful for the final answer?" |
-| Emitting $\langle\texttt{continue}\rangle$ after chunk1 | "Was it right to keep going here?" |
 | Generating chunk2 tokens | "These were deleted — was generating them a waste?" |
-| Emitting $\langle\texttt{backoff}\rangle$ | **"Was it right to undo at this point?"** |
+| Emitting `<backoff_N>` | **"Was it right to undo at this point, and was the depth correct?"** |
 | Generating directive tokens | **"Did this directive lead to better reasoning?"** |
 | Generating chunk3 tokens | "Did the post-backoff reasoning reach the right answer?" |
-| Emitting $\langle\texttt{terminate}\rangle$ | "Was the answer ready at this point?" |
+| Emitting `</think>` | "Was the answer ready at this point?" |
 
 The deleted tokens (chunk2) still contribute to the trajectory log-probability and receive gradients. If a trajectory with backoff gets higher reward than one without, the model learns:
-- To detect when it's going down a bad path (emit $\langle\texttt{backoff}\rangle$ earlier)
+- To detect when it's going down a bad path (emit `<backoff_N>` earlier)
+- To choose the right rewind depth (via the N in `<backoff_N>`)
 - To write useful directives (that lead to better post-backoff reasoning)
 - To avoid generating the bad tokens in the first place (over time)
 
@@ -106,15 +106,13 @@ Recommendation: start with option 3 (simplest), optimize later if needed.
 
 ### Backoff target selection
 
-Backoff operates at **per-semantic-boundary granularity**. After emitting $\langle\texttt{backoff}\rangle$, the model emits a depth token $d_t \in \mathcal{D} = \{\langle 1 \rangle, \ldots, \langle D_{\max} \rangle\}$ specifying how many semantic boundaries to rewind.
+Backoff operates at **per-semantic-boundary granularity**. The depth is encoded directly in the backoff token (`<backoff_1>`, `<backoff_2>`, `<backoff_3>`), so a single token determines both the action and the rewind distance.
 
-- $\langle 1 \rangle$ — undo one sentence (fine correction)
-- $\langle 3 \rangle$ — undo three sentences (moderate rewrite)
-- $\langle D_{\max} \rangle$ — undo many sentences (strategic pivot)
+- `<backoff_1>` — undo one boundary (fine correction)
+- `<backoff_2>` — undo two boundaries (moderate rewrite)
+- `<backoff_3>` — undo three boundaries (strategic pivot)
 
-$D_{\max} = 5$ is a reasonable default. Clamped to `len(boundaries) - 1` to prevent rewinding past the prompt.
-
-The depth decision adds one extra token to the trajectory likelihood — the model learns optimal rewind distance through RL.
+$D_{\max} = 3$. Clamped to `len(boundaries) - 1` to prevent rewinding past the prompt. The model learns optimal rewind distance through RL.
 
 ### Maximum backoff count per trajectory
 
@@ -122,11 +120,11 @@ Unbounded backoffs could create infinite loops (backoff → generate → backoff
 
 $$B_{\max} \in \{2, 3\}$$
 
-After $B_{\max}$ backoffs, the $\langle\texttt{backoff}\rangle$ action is masked out. The model can only continue or terminate.
+After $B_{\max}$ backoffs, backoff tokens are suppressed. The model can only continue generating or terminate with `</think>`.
 
 ### Directive length cap
 
-Cap directive at $K_{\text{dir}} \leq 20$ tokens. If the model hasn't emitted $\langle\texttt{continue}\rangle$ by then, force-append it and resume generation.
+Cap directive at $K_{\text{dir}} \leq 20$ tokens of free text. After the directive, generation resumes normally.
 
 ---
 
@@ -147,7 +145,7 @@ If during training we observe specific failure modes, a targeted fix becomes jus
 
 | Failure mode | Possible custom fix |
 |-------------|-------------------|
-| Backoff rate collapses to 0% (model never backs off) | Separate KL coefficient for action tokens: $\beta_{\text{action}} < \beta_{\text{reason}}$ so the model is freer to explore backoff |
+| Backoff rate collapses to 0% (model never emits `<backoff_N>`) | Separate KL coefficient for backoff tokens: $\beta_{\text{action}} < \beta_{\text{reason}}$ so the model is freer to explore backoff |
 | Backoff rate explodes to 80%+ (model always backs off) | Reduce $\alpha$ or add a small backoff penalty |
 | Progress signal is too noisy (greedy probes disagree) | Increase `num_probes` for smoother estimates |
 | Directive tokens are always identical / generic | Increase entropy bonus specifically on directive tokens |
@@ -159,7 +157,7 @@ The most defensible custom contribution would be **heterogeneous KL regularizati
 
 $$\mathrm{KL}_{\text{het}}(\pi_\theta \| \pi_{\text{ref}}) = \beta_{\text{reason}} \cdot \mathrm{KL}_{\text{reason}}(\pi_\theta \| \pi_{\text{ref}}) + \beta_{\text{action}} \cdot \mathrm{KL}_{\text{action}}(\pi_\theta \| \pi_{\text{ref}})$$
 
-**Justification:** Action tokens ($\langle\texttt{backoff}\rangle$, $\langle\texttt{continue}\rangle$, $\langle\texttt{terminate}\rangle$) don't exist in the pretrained model — they're new tokens with randomly initialized embeddings. The pretrained reference policy $\pi_{\text{ref}}$ assigns near-uniform probability to them. A standard KL penalty therefore penalizes ANY non-uniform action distribution, even a clearly useful one (like "always continue on easy problems, backoff on hard ones"). Using a lower $\beta_{\text{action}}$ lets the model develop strong action preferences without being pulled back to the meaningless reference distribution.
+**Justification:** Backoff tokens (`<backoff_1/2/3>`) don't exist in the pretrained model — they're new tokens with mean-initialized embeddings. The pretrained reference policy $\pi_{\text{ref}}$ assigns near-uniform probability to them. A standard KL penalty therefore penalizes ANY non-uniform backoff distribution, even a clearly useful one. Using a lower $\beta_{\text{action}}$ lets the model develop strong backoff preferences without being pulled back to the meaningless reference distribution.
 
 But again — only propose this if vanilla GRPO shows the problem.
 
@@ -192,9 +190,9 @@ GSM8K yields only ~350 real backoff examples from 7.5k problems. MATH should yie
 
 ### Grading pitfalls
 
-`extract_predicted_number()` must handle LaTeX formatting in `\boxed{}`:
-- `\boxed{\$840}` → strip `\$` → `840` (not `\840`)
-- `\boxed{\dfrac{8}{3}}` → extract first number → `8` (or handle fractions)
+`extract_boxed_answer()` must handle diverse LaTeX formatting in `\boxed{}`:
+- `\boxed{\$840}` → strip `\$` → `840`
+- `\boxed{\dfrac{8}{3}}` → handle nested braces and fractions
 - `\boxed{4,000,000}` vs gold `4` → units mismatch causes false negatives
 
-These grading errors create **poisoned training data** — examples where the "wrong" rollout was actually correct, teaching the model to backoff from correct reasoning. Fixed in `src/data/gsm8k.py`.
+These grading errors create **poisoned training data** — examples where the "wrong" rollout was actually correct, teaching the model to backoff from correct reasoning. Robust answer extraction and normalization implemented in `src/data/math.py`.

@@ -43,7 +43,7 @@
 - On-policy data is non-negotiable — off-policy correction traces cause distribution shift (SCoRe §4)
 - Synthetic perturbation (number swaps) doesn't match real failure patterns — use the model's own wrong rollouts instead (S²R §2.2.2)
 - Reward shaping prevents behavior collapse toward "just get it right the first time" (SCoRe §5.2)
-- Need a dataset where the model actually fails: GSM8K is too easy for 1.7B models (~93% pass rate), MATH is better
+- Need a dataset where the model actually fails: GSM8K is too easy for Qwen3-1.7B (~93% pass rate), MATH is the right fit
 
 ### RL for Reasoning
 - PPO (Schulman et al., 2017) — stable policy gradient method

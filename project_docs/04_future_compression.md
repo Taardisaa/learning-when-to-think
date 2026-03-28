@@ -91,10 +91,10 @@ This reframes the three levels of compression:
 
 **Level 0 (current text directive):** The model writes text like `"36 is wrong, should be 35"`. These tokens, when re-encoded into the clean cache, produce hidden states that steer the continuation. The model is compressing its error understanding into natural language, then decompressing it through re-encoding. GRPO optimizes the text to be maximally informative for correction.
 
-**Level 1 (hidden state injection):** Instead of going through the text bottleneck, directly inject the hidden state from the `<backoff>`/`<depth>` position into the clean cache as a phantom KV entry. No separate module — the LLM's own representations are the compressed format. The model learns to pack error-relevant information into the `<backoff>` token's hidden state because GRPO rewards continuations that use it well. Implementation:
+**Level 1 (hidden state injection):** Instead of going through the text bottleneck, directly inject the hidden state from the `<backoff_N>` position into the clean cache as a phantom KV entry. No separate module — the LLM's own representations are the compressed format. The model learns to pack error-relevant information into the backoff token's hidden state because GRPO rewards continuations that use it well. Implementation:
 ```
-1. Run wrong tokens → <backoff> → <depth>
-2. Extract hidden state h at the <depth> position  (already computed)
+1. Run wrong tokens → <backoff_N>
+2. Extract hidden state h at the <backoff_N> position  (already computed)
 3. Truncate KV cache
 4. Insert h as an extra key-value entry in the clean cache
 5. All continuation tokens attend to h via normal attention

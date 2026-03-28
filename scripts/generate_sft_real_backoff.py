@@ -8,14 +8,17 @@ Instead of synthetically perturbing numbers in correct rollouts, this script:
 The model learns from its own actual failure patterns, not synthetic errors.
 
 Usage:
-    # Full pipeline: generate K=8 rollouts + build SFT data
-    python scripts/generate_sft_real_backoff.py --model Qwen/Qwen3-1.7B
+    # MATH dataset (default) — full pipeline
+    python scripts/generate_sft_real_backoff.py --model Qwen/Qwen3-1.7B --dataset math
+
+    # GSM8K dataset
+    python scripts/generate_sft_real_backoff.py --model Qwen/Qwen3-1.7B --dataset gsm8k
 
     # Use pre-generated grouped rollouts
-    python scripts/generate_sft_real_backoff.py --rollouts data/rollouts_grouped_Qwen3-1.7B.jsonl
+    python scripts/generate_sft_real_backoff.py --rollouts data/rollouts_grouped_math_Qwen3-1.7B.jsonl
 
     # Dry-run on small subset
-    python scripts/generate_sft_real_backoff.py --model Qwen/Qwen3-1.7B --subset 100
+    python scripts/generate_sft_real_backoff.py --model Qwen/Qwen3-1.7B --subset 200
 """
 
 import argparse
@@ -28,7 +31,8 @@ from pathlib import Path
 import numpy as np
 from vllm import LLM, SamplingParams
 
-from src.data.gsm8k import load_gsm8k, extract_predicted_number
+from src.data.gsm8k import load_gsm8k, extract_predicted_number, grade_answer
+from src.data.math import load_math_train, extract_boxed_answer, grade_math_answer
 from src.data.synthetic import format_chat, save_sft_dataset, make_wrong_step
 from src.prompt import build_prompt
 
@@ -107,6 +111,18 @@ def _make_real_directive(
 # ── Multi-sample rollout generation ──
 
 
+def _gsm8k_extract_and_grade(text: str, gold: str) -> tuple[str | None, bool]:
+    """Extract and grade for GSM8K (numeric answers)."""
+    pred = extract_predicted_number(text)
+    return pred, grade_answer(pred, gold)
+
+
+def _math_extract_and_grade(text: str, gold: str) -> tuple[str | None, bool]:
+    """Extract and grade for MATH (LaTeX boxed answers)."""
+    pred = extract_boxed_answer(text)
+    return pred, grade_math_answer(pred, gold)
+
+
 def generate_grouped_rollouts(
     model_name: str,
     dataset: list[dict],
@@ -114,6 +130,7 @@ def generate_grouped_rollouts(
     max_tokens: int = 8192,
     tp: int = 2,
     gpu_mem: float = 0.90,
+    extract_and_grade=_gsm8k_extract_and_grade,
 ) -> list[dict]:
     """Generate K rollouts per problem and group them with pass rates."""
     print(f"\nGenerating {num_samples} rollouts/problem with {model_name}...")
@@ -155,8 +172,7 @@ def generate_grouped_rollouts(
         rollouts = []
         for completion in output.outputs:
             text = completion.text
-            predicted = extract_predicted_number(text)
-            is_correct = predicted is not None and predicted == ex["answer_number"]
+            predicted, is_correct = extract_and_grade(text, ex["answer_number"])
             rollouts.append({
                 "text": text,
                 "predicted": predicted,
@@ -240,7 +256,7 @@ def build_backoff_from_real_rollouts(
     gold_answer: str,
     num_wrong_attempts: int,
     rng: random.Random,
-    token_budget: int = 2048,
+    token_budget: int = 8192,
 ) -> str | None:
     """Stitch real wrong rollout(s) + backoff + correct rollout.
 
@@ -433,13 +449,16 @@ def main():
     )
     parser.add_argument("--model", default="Qwen/Qwen3-1.7B",
                         help="Model for rollout generation")
+    parser.add_argument("--dataset", default="math", choices=["gsm8k", "math"],
+                        help="Training dataset (default: math)")
     parser.add_argument("--rollouts", default=None,
                         help="Pre-generated grouped rollouts JSONL")
-    parser.add_argument("--output", default="data/sft_real_backoff_train.jsonl")
+    parser.add_argument("--output", default=None,
+                        help="Output SFT JSONL (default: auto)")
     parser.add_argument("--rollouts-output", default=None,
                         help="Save grouped rollouts JSONL")
     parser.add_argument("--subset", type=int, default=None,
-                        help="Limit number of GSM8K train problems")
+                        help="Limit number of train problems")
     parser.add_argument("--num-samples", type=int, default=8,
                         help="K rollouts per problem")
     parser.add_argument("--backoff-ratio", type=float, default=0.75)
@@ -452,19 +471,36 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    # Select dataset and grading function
+    if args.dataset == "math":
+        extract_and_grade = _math_extract_and_grade
+        dataset_tag = "math"
+    else:
+        extract_and_grade = _gsm8k_extract_and_grade
+        dataset_tag = "gsm8k"
+
+    if args.output is None:
+        args.output = f"data/sft_real_backoff_{dataset_tag}_train.jsonl"
+
     if args.rollouts:
         print(f"Loading grouped rollouts from {args.rollouts}...")
         with open(args.rollouts) as f:
             grouped = [json.loads(line) for line in f]
         print(f"  Total problems: {len(grouped)}")
     else:
-        data = load_gsm8k("train", subset_size=args.subset)
+        if args.dataset == "math":
+            data = load_math_train(subset_size=args.subset)
+        else:
+            data = load_gsm8k("train", subset_size=args.subset)
+        print(f"Dataset: {args.dataset}, {len(data)} problems")
+
         grouped = generate_grouped_rollouts(
             args.model, data,
             num_samples=args.num_samples,
             max_tokens=args.max_tokens,
             tp=args.tp,
             gpu_mem=args.gpu_mem,
+            extract_and_grade=extract_and_grade,
         )
 
         # Save grouped rollouts for reuse
@@ -472,7 +508,7 @@ def main():
             rollouts_path = args.rollouts_output
         else:
             short_name = args.model.split("/")[-1]
-            rollouts_path = f"data/rollouts_grouped_{short_name}.jsonl"
+            rollouts_path = f"data/rollouts_grouped_{dataset_tag}_{short_name}.jsonl"
         Path(rollouts_path).parent.mkdir(parents=True, exist_ok=True)
         with open(rollouts_path, "w") as f:
             for g in grouped:

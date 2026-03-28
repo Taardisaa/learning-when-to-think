@@ -19,7 +19,7 @@ This is the same model, at the same level of reasoning, asked to **explicitly ju
 Our backoff is **entirely model-driven** — the model emits `<backoff_N>` tokens as a learned policy decision shaped by GRPO. There is no explicit entropy threshold, no rule-based trigger. At each semantic boundary the model chooses from:
 
 $$
-A = \{\texttt{<continue>},\; \texttt{<backoff\_1>},\; \texttt{<backoff\_2>},\; \texttt{<backoff\_3>},\; \texttt{</think>}\}
+A = \{\texttt{<backoff\_1>},\; \texttt{<backoff\_2>},\; \texttt{<backoff\_3>},\; \texttt{</think>}\}
 $$
 
 The probability assigned to backoff:
@@ -33,7 +33,7 @@ For GRPO to have trained the model to emit backoff when reasoning has gone wrong
 When the model is uncertain about what to say next — hedging between contradictory reasoning steps — that manifests as high entropy in the content tokens, and it's also the signal that the preceding reasoning was shaky. The chain:
 
 $$
-\text{bad reasoning path} \;\rightarrow\; \text{high } H(y_t) \text{ in content tokens} \;\rightarrow\; \text{hidden state encodes confusion} \;\rightarrow\; P(\texttt{<backoff>}) \uparrow
+\text{bad reasoning path} \;\rightarrow\; \text{high } H(y_t) \text{ in content tokens} \;\rightarrow\; \text{hidden state encodes confusion} \;\rightarrow\; P(\texttt{<backoff\_N>}) \uparrow
 $$
 
 The model doesn't compute entropy explicitly. But GRPO **shaped the policy so that the same internal state** that would manifest as high content-token entropy also triggers backoff emission. They're two readouts of the same underlying representation.
@@ -79,8 +79,8 @@ $$
 ### Step 2: Plot and correlate
 
 1. **$P(\text{backoff})$ vs $\bar{H}_{\text{preceding chunk}}$**: bin boundaries by entropy, compute backoff rate per bin. Expect monotonically increasing.
-2. **Conditional accuracy**: among high-entropy chunks, compare accuracy when model chose `<continue>` vs `<backoff>`. If backoff helps, accuracy-after-backoff should exceed accuracy-after-continue in high-entropy regions.
-3. **False positive rate**: among low-entropy chunks where model chose `<backoff>`, how often was the original path actually correct? This is the Huang failure mode (Correct→Incorrect flip) — we want this to be low.
+2. **Conditional accuracy**: among high-entropy chunks, compare accuracy when the model continued normally vs emitted `<backoff_N>`. If backoff helps, accuracy-after-backoff should exceed accuracy-after-continue in high-entropy regions.
+3. **False positive rate**: among low-entropy chunks where model emitted `<backoff_N>`, how often was the original path actually correct? This is the Huang failure mode (Correct→Incorrect flip) — we want this to be low.
 
 ### Step 3: Interpret
 
@@ -106,7 +106,7 @@ But instead of a fixed threshold $\tau$ and fixed $k$, both are **learned and co
 
 ## Mechanistic Inspection: Looking Inside the Model
 
-**Target model:** Qwen3-4B (~36 layers, GQA with 32 query / 8 KV heads, bf16 ≈ 8 GB). Comfortably fits on a single GPU for inference with forward hooks. All methods below require only inference — no additional training except the linear probe.
+**Target model:** Qwen3-1.7B (GQA, bf16). Comfortably fits on a single GPU for inference with forward hooks. All methods below require only inference — no additional training except the linear probe.
 
 ### Inspection 1: Linear Probe on Residual Stream
 
@@ -161,13 +161,13 @@ Plot $P_{\text{backoff}}^{(l)}$ vs layer $l$ for continue-examples and backoff-e
 **Practical notes:**
 - Register forward hooks on each layer's output. Single forward pass per example.
 - Aggregate over ~1k boundary examples for clean curves.
-- The 4B model (vs 0.8B) likely shows a **sharper layer transition** — more depth gives more separation between "still computing" and "decided."
+- A larger model would likely show a **sharper layer transition** — more depth gives more separation between "still computing" and "decided."
 
 ### Inspection 3: Activation Patching (Causal Tracing)
 
 **Goal:** Which layers/components are **causally responsible** for the backoff decision?
 
-**Method:** Find paired examples — same or similar prefix, but one leads to `<continue>` and the other to `<backoff>`. Then:
+**Method:** Find paired examples — same or similar prefix, but one continues normally and the other emits `<backoff_N>`. Then:
 
 1. Run clean forward pass on the backoff example → gets backoff logit $z_{\text{backoff}}^{\text{clean}}$
 2. Run clean forward pass on the continue example → gets its activations at every layer
@@ -216,7 +216,7 @@ Rank neurons by $|r_{l,i}|$. The top-$k$ are "backoff neurons."
 - If top neurons respond to **specific error patterns** (arithmetic mistakes, entity confusion) → the model has specialized error detectors
 
 **Practical notes:**
-- 4B has wider MLP layers than 0.8B, so expect more specialized neurons with cleaner activation patterns
+- Larger models have wider MLP layers, so expect more specialized neurons with cleaner activation patterns
 - Collect ~5k–10k boundary examples. Correlation computation is fast (just matrix ops).
 - Can also check if top backoff neurons overlap with neurons that have high correlation with $\bar{H}_{\text{chunk}}$ — direct test of whether entropy and backoff share neural substrate.
 
@@ -232,4 +232,4 @@ Rank neurons by $|r_{l,i}|$. The top-$k$ are "backoff neurons."
 | **4** | Top backoff neurons (MLP correlation) | ~5k forward passes + correlation | What features drive backoff? Surface uncertainty vs deep logic? |
 | **5** | Activation patching | ~18k forward passes | Causal circuit: which layers/heads are necessary? |
 
-Priority 1 requires no new infrastructure — just logging in the existing generation loop. Priorities 2–4 need a simple hook-based script. Priority 5 is the most expensive but gives the strongest causal story. All are single-GPU feasible on Qwen3-4B.
+Priority 1 requires no new infrastructure — just logging in the existing generation loop. Priorities 2–4 need a simple hook-based script. Priority 5 is the most expensive but gives the strongest causal story. All are single-GPU feasible on Qwen3-1.7B.
