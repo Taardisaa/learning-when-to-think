@@ -49,3 +49,4 @@ checkpoints/
 baselines/*
 eval_results/*
 deprecated/*
+results/probe/sweep_results.json

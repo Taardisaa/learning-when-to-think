@@ -102,3 +102,7 @@ When an entry has multiple backoff tokens, each must govern a **separate wrong r
 - **Semantic-preserving**: The final reasoning chain must be coherent and arrive at the correct answer.
 - **Correct final answer**: Every entry's `\boxed{}` must match the gold answer.
 - **Correct think boundary**: A CoT chain should be correctly boxed by `<think>` and `</think>` tokens.
+
+## Paper 
+
+For a paper summary at `papers/read/`, its related paper is just at `papers/`, categorized into a subdirectory by its topic. You may want to also read the paper before make any conclusion
