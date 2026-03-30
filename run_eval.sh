@@ -5,6 +5,16 @@ CUDA_VISIBLE_DEVICES=0 ./venv/bin/python -m scripts.eval_phase1 --base-model Qwe
 PYTHONPATH=. torchrun --nproc_per_node 2 scripts/train_phase1.py --model Qwen/Qwen3-4B-Thinking-2507 --output checkpoints/phase1_4B/final --epochs 1
 
 
+# Boundary
+
+python scripts/annotate_boundaries.py \                                            
+      --rollouts data/rollouts_grouped_math_Qwen3-1.7B.jsonl \                       
+      --model Qwen/Qwen3-32B \                                
+      --num-rollouts 10 \                                                            
+      --output data/boundary_annotations_test.jsonl \                                
+      --validate 
+
+
 
 # Thinking enabled.
 PYTHONPATH=. ./venv/bin/python -m scripts.eval_math500 --model Qwen/Qwen3-1.7B --n 500 --tp 2

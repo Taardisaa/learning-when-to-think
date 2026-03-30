@@ -21,47 +21,50 @@ import argparse
 import json
 import random
 import re
+import sys
 import time
 from pathlib import Path
 
+# Ensure project root is on sys.path so `src` is importable
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from vllm import LLM, SamplingParams
 
+
+BOUNDARY_TAG = "<|seg|>"
 
 ANNOTATION_PROMPT = """\
 You are annotating semantic boundaries in a mathematical reasoning trace.
 A semantic boundary is a natural transition point where the reasoning shifts to a distinct step.
 
-Boundary types (mark these):
+Your task: reproduce the reasoning trace below EXACTLY, but insert the marker {boundary_tag} at every semantic boundary point.
+
+Boundary types (insert {boundary_tag} here):
 1. After a sentence-ending period where the next sentence starts a NEW reasoning step
 2. Before a logical connective that introduces a new direction ("So now...", "Therefore...", "Wait...", "Let me...", "Next...", "However...")
 3. Between problem setup → equation formulation → solving → verification → answer extraction
 4. After a completed sub-calculation before its result is used downstream
-5. After a paragraph break (\\n\\n) where the topic shifts
+5. After a paragraph break where the topic shifts
 
-NOT a boundary (do NOT mark these):
+NOT a boundary (do NOT insert {boundary_tag}):
 - Mid-sentence or mid-formula (e.g., inside "x^2 + 3x = 0")
 - Between consecutive lines of the same algebraic simplification
 - Inside a single logical step that hasn't concluded yet
 - Between a connective and its clause (e.g., between "Therefore" and "x = 5")
 
-Given the reasoning trace below, output ONLY a JSON array of character offsets. Each offset is the index of the FIRST character of the new reasoning step (the character immediately after the boundary point).
-
 Example:
-Trace: "First, x = 2 + 3 = 5. Now I need to find y. Since y = x^2, y = 25."
-Output: [21, 42]
-(21 = start of "Now I need...", 42 = start of "Since y =...")
+Input: "First, x = 2 + 3 = 5. Now I need to find y. Since y = x^2, y = 25."
+Output: "First, x = 2 + 3 = 5. {boundary_tag}Now I need to find y. {boundary_tag}Since y = x^2, y = 25."
 
-Reasoning trace:
-\"\"\"
-{rollout_text}
-\"\"\"
+Now reproduce the following trace with {boundary_tag} markers inserted at boundary points. Output ONLY the annotated text, nothing else.
 
-Output (JSON array of integers only, no explanation):"""
+{rollout_text}"""
 
 
 def _build_annotation_prompt(tokenizer, rollout_text: str) -> str:
     """Build chat-formatted prompt for boundary annotation."""
     content = ANNOTATION_PROMPT.replace("{rollout_text}", rollout_text)
+    content = content.replace("{boundary_tag}", BOUNDARY_TAG)
     messages = [{"role": "user", "content": content}]
     try:
         prompt = tokenizer.apply_chat_template(
@@ -82,23 +85,31 @@ def _strip_think_tags(text: str) -> str:
     return text.strip()
 
 
-def _parse_offsets(response: str) -> list[int] | None:
-    """Parse JSON array of integers from LLM response."""
-    # Try to find a JSON array in the response
-    match = re.search(r"\[[\d\s,]*\]", response)
-    if not match:
-        return None
-    try:
-        offsets = json.loads(match.group())
-        if isinstance(offsets, list) and all(isinstance(x, int) for x in offsets):
-            return sorted(offsets)
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return None
+def _parse_tagged_response(response: str) -> list[int]:
+    """Extract boundary char offsets from LLM response containing <|seg|> tags.
+
+    Strips the tags and computes the char offset in the original (untagged)
+    text where each tag appeared.
+    """
+    tag = BOUNDARY_TAG
+    offsets = []
+    # Walk through the response, tracking position in the clean text
+    clean_pos = 0
+    i = 0
+    while i < len(response):
+        if response[i:i + len(tag)] == tag:
+            offsets.append(clean_pos)
+            i += len(tag)
+        else:
+            clean_pos += 1
+            i += 1
+
+    return offsets
 
 
 def _select_rollouts(
-    grouped_path: str, num_rollouts: int, seed: int
+    grouped_path: str, num_rollouts: int, seed: int,
+    min_chars: int = 100, max_chars: int = 16000,
 ) -> list[dict]:
     """Load and sample rollouts from grouped JSONL.
 
@@ -123,8 +134,13 @@ def _select_rollouts(
                 "rollout_idx": j,
             })
 
-    # Filter out very short rollouts (< 100 chars)
-    all_rollouts = [r for r in all_rollouts if len(r["text"]) >= 100]
+    # Filter by length
+    before = len(all_rollouts)
+    all_rollouts = [r for r in all_rollouts
+                    if min_chars <= len(r["text"]) <= max_chars]
+    skipped = before - len(all_rollouts)
+    if skipped:
+        print(f"  Filtered {skipped} rollouts outside [{min_chars}, {max_chars}] chars")
 
     # Sample
     if num_rollouts < len(all_rollouts):
@@ -138,46 +154,66 @@ def annotate_boundaries(
     rollouts: list[dict],
     tp: int = 2,
     gpu_mem: float = 0.90,
-    max_tokens: int = 512,
 ) -> list[dict]:
     """Run Qwen3-32B to annotate boundaries on rollout texts."""
+    max_model_len = 32768
+
     print(f"\nLoading {model_name} for boundary annotation...")
     llm = LLM(
         model=model_name,
         trust_remote_code=True,
         tensor_parallel_size=tp,
-        max_model_len=8192,
+        max_model_len=max_model_len,
         dtype="bfloat16",
         gpu_memory_utilization=gpu_mem,
     )
     tokenizer = llm.get_tokenizer()
 
-    # Build prompts
+    # Build prompts, skip those that won't fit (prompt + output must fit in context)
+    # Output ≈ same length as input text (it's a copy with tags inserted)
     prompts = []
+    valid_rollouts = []
+    output_token_limits = []
+    skipped = 0
     for r in rollouts:
-        prompts.append(_build_annotation_prompt(tokenizer, r["text"]))
+        prompt = _build_annotation_prompt(tokenizer, r["text"])
+        prompt_tokens = len(tokenizer.encode(prompt))
+        # Output needs roughly as many tokens as the rollout text itself + margin for tags
+        text_tokens = len(tokenizer.encode(r["text"]))
+        out_tokens = int(text_tokens * 1.2) + 100  # 20% margin for tags
+        if prompt_tokens + out_tokens > max_model_len:
+            skipped += 1
+            continue
+        prompts.append(prompt)
+        valid_rollouts.append(r)
+        output_token_limits.append(out_tokens)
 
+    if skipped:
+        print(f"  Skipped {skipped} rollouts exceeding context limit")
+
+    # Use the max output limit across all rollouts (vLLM uses shared params)
+    max_out = max(output_token_limits) if output_token_limits else 4096
     params = SamplingParams(
-        max_tokens=max_tokens,
+        max_tokens=max_out,
         temperature=0.0,  # deterministic for annotation
     )
 
-    print(f"  Annotating {len(prompts)} rollouts...")
+    print(f"  Annotating {len(prompts)} rollouts (max_output_tokens={max_out})...")
     t0 = time.time()
     outputs = llm.generate(prompts, params)
     elapsed = time.time() - t0
     print(f"  Done in {elapsed:.1f}s ({elapsed/len(prompts):.2f}s/rollout)")
+    rollouts = valid_rollouts
 
-    # Parse responses
+    # Parse responses — extract boundary positions from tagged text
     results = []
     parse_failures = 0
     for r, output in zip(rollouts, outputs):
         response = output.outputs[0].text
-        offsets = _parse_offsets(response)
+        offsets = _parse_tagged_response(response)
 
-        if offsets is None:
+        if not offsets:
             parse_failures += 1
-            offsets = []
 
         # Filter offsets that are out of range
         text_len = len(r["text"])
@@ -272,6 +308,10 @@ def main():
     parser.add_argument("--tp", type=int, default=2,
                         help="Tensor parallel size for vLLM")
     parser.add_argument("--gpu-mem", type=float, default=0.90)
+    parser.add_argument("--min-chars", type=int, default=100,
+                        help="Skip rollouts shorter than this (chars)")
+    parser.add_argument("--max-chars", type=int, default=16000,
+                        help="Skip rollouts longer than this (chars, ~4000 tokens)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--validate", action="store_true",
                         help="Run heuristic validation after annotation")
@@ -279,7 +319,10 @@ def main():
 
     # Select rollouts
     print(f"Loading rollouts from {args.rollouts}...")
-    rollouts = _select_rollouts(args.rollouts, args.num_rollouts, args.seed)
+    rollouts = _select_rollouts(
+        args.rollouts, args.num_rollouts, args.seed,
+        min_chars=args.min_chars, max_chars=args.max_chars,
+    )
     print(f"  Selected {len(rollouts)} rollouts")
     correct_pct = 100 * sum(1 for r in rollouts if r["correct"]) / len(rollouts)
     print(f"  Correct: {correct_pct:.1f}%, Incorrect: {100-correct_pct:.1f}%")

@@ -72,8 +72,8 @@ def extract_hidden_states(
     layers: list[int] | None = None,
     all_layers: bool = False,
     device: str = "cuda",
-    batch_size: int = 4,
-) -> dict:
+    output_dir: str = "data/probe_features",
+):
     """Extract hidden states from frozen model and align with boundary labels.
 
     Returns dict with:
@@ -108,12 +108,22 @@ def extract_hidden_states(
 
     print(f"  Extracting layers: {target_layers}")
 
-    # Process rollouts
-    all_features = {l: [] for l in target_layers}
-    all_labels = []
+    # Prepare output directory for streaming writes
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Open per-layer files for streaming writes
+    layer_files = {}
+    for l in target_layers:
+        layer_files[l] = open(out_dir / f"features_layer{l}.bin", "wb")
+    labels_file = open(out_dir / f"labels.bin", "wb")
+    dist_labels_file = open(out_dir / f"dist_labels.bin", "wb")
+
     rollout_boundaries = []
-    metadata = []
+    metadata_list = []
     global_idx = 0
+    total_tokens = 0
+    total_boundaries = 0
 
     t0 = time.time()
     for i, ann in enumerate(annotations):
@@ -132,25 +142,45 @@ def extract_hidden_states(
             if idx < num_tokens:
                 labels[idx] = 1
 
+        # Create distance labels: forward-looking distance to NEXT boundary
+        # For each token t, how many tokens until the next boundary ahead?
+        # Boundary tokens themselves get 0.
+        import math
+        boundary_set = sorted(set(boundary_tok_indices))
+        dist_labels = torch.zeros(num_tokens, dtype=torch.float)
+        # Walk backwards: for each token, find the next boundary >= t
+        next_boundary = num_tokens  # default: no boundary ahead
+        for t in range(num_tokens - 1, -1, -1):
+            if t in set(boundary_set):
+                next_boundary = t
+            dist_labels[t] = next_boundary - t
+
+        # Log-normalize: compress long tail, keep 0 at boundary
+        dist_labels = torch.tensor([math.log(d + 1) for d in dist_labels.tolist()],
+                                   dtype=torch.float)
+
         # Forward pass
         input_ids = torch.tensor([token_ids], device=device)
         with torch.no_grad():
             outputs = model(input_ids, output_hidden_states=True)
 
-        # Extract hidden states at target layers
-        # outputs.hidden_states is tuple of (num_layers+1) tensors, each [1, seq_len, hidden_dim]
+        # Stream hidden states to disk immediately, don't accumulate
         hidden_states = outputs.hidden_states
-
         for layer_idx in target_layers:
             if layer_idx < len(hidden_states):
-                hs = hidden_states[layer_idx][0].cpu().float()  # [seq_len, hidden_dim]
-                all_features[layer_idx].append(hs)
+                hs = hidden_states[layer_idx][0].cpu().half()  # [seq_len, hidden_dim], float16
+                layer_files[layer_idx].write(hs.numpy().tobytes())
 
-        all_labels.append(labels)
+        # Stream labels to disk
+        labels_file.write(labels.numpy().tobytes())
+        dist_labels_file.write(dist_labels.numpy().tobytes())
+
         rollout_boundaries.append((global_idx, global_idx + num_tokens))
         global_idx += num_tokens
+        total_tokens += num_tokens
+        total_boundaries += labels.sum().item()
 
-        metadata.append({
+        metadata_list.append({
             "question": ann["question"][:100],
             "correct": ann["correct"],
             "num_tokens": num_tokens,
@@ -158,40 +188,45 @@ def extract_hidden_states(
             "boundary_token_indices": boundary_tok_indices,
         })
 
+        # Explicitly free GPU tensors
+        del outputs, hidden_states, input_ids
         if (i + 1) % 50 == 0:
+            torch.cuda.empty_cache()
             elapsed = time.time() - t0
             print(f"  Processed {i+1}/{len(annotations)} "
                   f"({elapsed:.1f}s, {elapsed/(i+1):.2f}s/rollout)")
 
     elapsed = time.time() - t0
     print(f"  Done: {len(annotations)} rollouts in {elapsed:.1f}s")
-
-    # Concatenate
-    features = {}
-    for layer_idx in target_layers:
-        if all_features[layer_idx]:
-            features[layer_idx] = torch.cat(all_features[layer_idx], dim=0)
-    labels = torch.cat(all_labels, dim=0)
-
-    total_tokens = len(labels)
-    total_boundaries = labels.sum().item()
     print(f"  Total tokens: {total_tokens}")
     print(f"  Total boundaries: {total_boundaries} ({100*total_boundaries/total_tokens:.1f}%)")
+
+    # Close streaming files
+    for f in layer_files.values():
+        f.close()
+    labels_file.close()
+    dist_labels_file.close()
+
+    # Save metadata
+    meta = {
+        "rollout_boundaries": rollout_boundaries,
+        "metadata": metadata_list,
+        "target_layers": target_layers,
+        "hidden_dim": hidden_dim,
+        "total_tokens": total_tokens,
+        "dtype": "float16",
+    }
+    with open(out_dir / "meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+    total_size = sum(f.stat().st_size for f in out_dir.iterdir()) / 1e9
+    print(f"\nSaved to {output_dir} ({total_size:.2f} GB)")
 
     # Free model
     del model
     import gc
     gc.collect()
     torch.cuda.empty_cache()
-
-    return {
-        "features": features,
-        "labels": labels,
-        "rollout_boundaries": rollout_boundaries,
-        "metadata": metadata,
-        "target_layers": target_layers,
-        "hidden_dim": hidden_dim,
-    }
 
 
 def compute_displacement(features: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
@@ -211,30 +246,45 @@ def compute_displacement(features: dict[int, torch.Tensor]) -> dict[int, torch.T
     return displacement
 
 
-def save_extracted(data: dict, output_dir: str):
-    """Save extracted features and labels to disk."""
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+def load_features_from_disk(features_dir: str) -> dict:
+    """Load streamed binary features and labels from disk.
 
-    # Save labels
-    torch.save(data["labels"], out / "labels.pt")
+    Returns dict with features (per-layer tensors), labels, and metadata.
+    """
+    d = Path(features_dir)
+    with open(d / "meta.json") as f:
+        meta = json.load(f)
 
-    # Save features per layer
-    for layer_idx, feat in data["features"].items():
-        torch.save(feat, out / f"features_layer{layer_idx}.pt")
+    hidden_dim = meta["hidden_dim"]
+    total_tokens = meta["total_tokens"]
 
-    # Save metadata
-    meta = {
-        "rollout_boundaries": data["rollout_boundaries"],
-        "metadata": data["metadata"],
-        "target_layers": data["target_layers"],
-        "hidden_dim": data["hidden_dim"],
+    # Load labels
+    labels_np = np.fromfile(d / "labels.bin", dtype=np.int64)
+    labels = torch.from_numpy(labels_np)
+
+    # Load distance labels (if available)
+    dist_path = d / "dist_labels.bin"
+    if dist_path.exists():
+        dist_np = np.fromfile(dist_path, dtype=np.float32)
+        dist_labels = torch.from_numpy(dist_np)
+    else:
+        dist_labels = None
+
+    # Load per-layer features as memory-mapped (lazy, doesn't eat RAM)
+    features = {}
+    for layer_idx in meta["target_layers"]:
+        path = d / f"features_layer{layer_idx}.bin"
+        if path.exists():
+            feat_mmap = np.memmap(path, dtype=np.float16, mode='r',
+                                  shape=(total_tokens, hidden_dim))
+            features[layer_idx] = feat_mmap
+
+    return {
+        "features": features,
+        "labels": labels,
+        "dist_labels": dist_labels,
+        "meta": meta,
     }
-    with open(out / "meta.json", "w") as f:
-        json.dump(meta, f, indent=2)
-
-    total_size = sum(f.stat().st_size for f in out.iterdir()) / 1e9
-    print(f"\nSaved to {output_dir} ({total_size:.2f} GB)")
 
 
 def main():
@@ -264,16 +314,14 @@ def main():
         annotations = annotations[:args.num_rollouts]
     print(f"  Processing {len(annotations)} rollouts")
 
-    # Extract
-    data = extract_hidden_states(
+    # Extract and stream to disk
+    extract_hidden_states(
         args.model, annotations,
         layers=args.layers,
         all_layers=args.all_layers,
         device=args.device,
+        output_dir=args.output,
     )
-
-    # Save
-    save_extracted(data, args.output)
 
 
 if __name__ == "__main__":

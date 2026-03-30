@@ -9,6 +9,64 @@ The heuristics work but have fundamental limits:
 - **Language-dependent**: hardcoded English connectives
 - **Not principled**: the model likely already "knows" where its reasoning steps begin and end — this information should be extractable from its hidden states
 
+## Boundary Definition
+
+A **semantic boundary** is a transition point between two distinct **reasoning steps** in a CoT trace. It is NOT a sentence boundary — it operates at a coarser granularity. A single reasoning step (chunk) typically spans 1-4 sentences and corresponds to one atomic cognitive operation.
+
+### What constitutes a reasoning step (chunk)
+
+Each chunk is a self-contained unit of reasoning that accomplishes one thing:
+
+| Chunk type | Example | Typical size |
+|------------|---------|-------------|
+| Problem interpretation | "So I need to find how many integers satisfy..." | 1-2 sentences |
+| Equation setup | "Let x be the number of apples. Then 3x + 5 = 20." | 1-3 sentences |
+| Algebraic manipulation | "Subtracting 5 from both sides: 3x = 15. Dividing by 3: x = 5." | 1-4 sentences |
+| Case analysis (one case) | "If n is even, then n² is divisible by 4, so..." | 2-4 sentences |
+| Sub-computation | "First compute C(8,2) = 28." | 1-2 sentences |
+| Verification / sanity check | "Let me verify: plugging x=5 back in, 3(5)+5 = 20. ✓" | 1-2 sentences |
+| Course correction | "Wait, that can't be right because... Let me reconsider." | 1-3 sentences |
+| Answer extraction | "Therefore the answer is 5." | 1 sentence |
+
+### Where boundaries go
+
+Boundaries are placed **between** chunks — at the point where the model transitions from one reasoning operation to the next.
+
+**Valid boundary points:**
+- Between problem interpretation and equation formulation
+- Between setting up an equation and solving it
+- Between computing an intermediate result and applying it
+- Between analyzing one case and moving to another
+- Before a course correction ("Wait...", "Actually...", "Hmm, but...")
+- Between solving and verifying
+- Between verification and final answer extraction
+- After a paragraph break (`\n\n`) that marks a topic shift
+
+**NOT boundary points:**
+- Between consecutive lines of the **same** algebraic simplification (those are one chunk)
+- Mid-sentence or mid-formula
+- Between a connective and its clause ("Therefore" and "x = 5" are part of the same chunk)
+- Between two sentences that elaborate the same point without advancing the reasoning
+
+### Granularity calibration
+
+The right granularity is: **a boundary marks where you could meaningfully "rewind to" during backoff.** If rewinding to a point wouldn't let you restart a distinct reasoning step, it's not a real boundary — it's just a sentence break within a step.
+
+Concretely, chunks should average **15-80 tokens** (matching `BoundaryTracker`'s `k_min=15`, `k_max=80`). A rollout of ~300 tokens should have roughly 5-15 boundaries. The number of boundaries scales roughly linearly with rollout length.
+
+### Relationship to discourse segmentation
+
+Our semantic boundaries are related to but distinct from EDUs (Elementary Discourse Units) in discourse analysis:
+
+| | EDU (discourse) | Our semantic boundary |
+|---|---|---|
+| Granularity | Clause-level (~5-15 tokens) | Reasoning-step-level (~15-80 tokens) |
+| What it segments | Rhetorical structure of text | Logical structure of reasoning |
+| One chunk contains | 1 EDU | 1-4 EDUs |
+| Defined by | Syntactic/rhetorical transitions | Cognitive operation transitions |
+
+Our boundaries are coarser — each chunk may contain multiple EDUs, but they all serve a single reasoning purpose.
+
 ## Related Work
 
 Several recent papers establish that LLM hidden states encode rich structural information:
