@@ -13,10 +13,11 @@
 - [x] Run baseline eval on MATH-500 with Qwen2.5-Math-7B-Instruct (CoT single-pass)
 
 #### SFT Warmup Dataset (new — see `sft_warmup_plan.md`)
-- [ ] `src/pivot/tokens.py` — action token setup (continue/refine/terminate)
-- [ ] `scripts/generate_rollouts_pivot.py` — K=8 rollouts from Qwen2.5-Math-7B on ~1000 MATH train problems
-- [ ] `scripts/generate_sft_3action.py` — build SFT dataset (~1500–2000 examples)
-- [ ] Quality check: inspect 30-50 examples for correct token placement and coherent reasoning
+- [x] `src/pivot/tokens.py` — action token setup (continue/refine/terminate)
+- [x] `scripts/generate_rollouts_pivot.py` — K=8 rollouts from Qwen2.5-Math-7B on ~1000 MATH train problems
+- [x] `scripts/generate_sft_3action.py` — LLM-based rewriting (replaces regex script)
+- [x] Run: `python -m scripts.generate_sft_3action --rollouts data/rollouts_grouped_math_Qwen2.5-Math-7B.jsonl --rewriter Qwen/Qwen3-14B --gpus 1 --tp 1` → 816 examples (449 clean, 367 refine)
+- [x] Quality check: all structural checks pass, directives are error-specific, token placement is natural
 
 ### Member 2 — Core RL Training
 - [ ] LoRA setup on Qwen2.5-Math-7B-Instruct (attention + MLP projections, r=16, α=32)

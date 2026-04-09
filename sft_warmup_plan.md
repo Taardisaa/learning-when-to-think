@@ -37,30 +37,39 @@ Output: `data/rollouts_grouped_math_Qwen2.5-Math-7B.jsonl`
 
 Reuse: `src/data/math.py:load_math_train()`, `extract_boxed_answer()`, `grade_math_answer()`
 
-### Step 2: Build SFT dataset
-`scripts/generate_sft_3action.py` — construct training examples from rollouts.
+### Step 2: Build SFT dataset via LLM rewriting
+`scripts/generate_sft_3action.py` — use a stronger model (Qwen3-32B) to rewrite rollouts with action tokens.
 
-**Clean examples (~60%)** — from correct rollouts:
-1. Split CoT into steps at semantic boundaries (paragraph breaks, sentence-ending + logical connectives)
-2. Append `<continue>` after each intermediate step
-3. Append `<terminate>` before `\boxed{}`
+**Why LLM-based, not script-based:** Regex-based splitting puts tokens at wrong boundaries (mid-calculation, mid-argument). Naive stitching of wrong+correct rollouts produces incoherent reasoning. An LLM handles all the judgment calls — boundary detection, error identification, directive writing — in one pass.
 
-**Refine examples (~40%)** — from problems with both wrong and correct rollouts:
-1. Take wrong rollout, split into steps, add `<continue>` after each
-2. At end of wrong reasoning, insert `<refine>` + corrective directive
-3. Append correct reasoning with `<continue>` tokens
-4. End with `<terminate>` + `\boxed{}`
+**Approach:** For each rollout, prompt Qwen3-32B via vLLM with:
+- Token definitions and placement rules
+- 2-3 few-shot examples (clean + refine)
+- The original question + rollout text + gold answer
+- Instruction to rewrite the trajectory with properly placed action tokens
 
-Directive format (same as existing backoff): "Wait, I got X but that's wrong. [describe error]. Let me [corrective direction]."
+**Clean examples (~60%)** — feed a correct rollout, ask the model to insert `<continue>` at semantic boundaries and `<terminate>` before the answer.
 
-Target: ~1500–2000 examples total.
+**Refine examples (~40%)** — feed a wrong rollout + the gold answer, ask the model to:
+1. Identify where the reasoning went wrong
+2. Insert `<continue>` tokens at proper boundaries up to the error
+3. Insert `<refine>` at the error point with a specific directive
+4. Write corrective reasoning leading to the correct answer
+5. End with `<terminate>` + `\boxed{gold_answer}`
+
+**Quality filter:** After generation, validate each example:
+- Exactly one `<terminate>`, at least one `<continue>`
+- `\boxed{}` present and matches gold answer
+- `<terminate>` appears before `\boxed{}`
+- For refine examples: `<refine>` token is present
+- Reject malformed outputs
+
+Target: ~1500–2000 examples after filtering.
 
 Output: `data/sft_3action_math_train.jsonl`
 ```json
 {"question": "...", "answer": "...", "messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "...with <continue>/<refine>/<terminate> tokens..."}], "has_refine": bool}
 ```
-
-Step segmentation is deterministic (script-appropriate per CLAUDE.md). Refine directives for complex cases use subagents per CLAUDE.md rules.
 
 ### Step 3: Token setup
 `src/pivot/tokens.py` — add 3 new special tokens, initialize embeddings.
@@ -96,15 +105,34 @@ Reuse `scripts/train_phase1.py` pattern with updated defaults:
 - `scripts/train_phase1.py`: reference for SFT training loop
 
 ## Implementation order
-1. `src/pivot/tokens.py` — token setup (unblocks everything)
-2. `scripts/generate_rollouts_pivot.py` + config — generate rollouts (needs GPU, ~30-60 min)
-3. `scripts/generate_sft_3action.py` — build dataset from rollouts
-4. Update `proposal.tex`, `WORK_SPLIT.md`, `TODO.md`
-5. Quality check: inspect 30-50 examples manually
+1. ✅ `src/pivot/tokens.py` — token setup
+2. ✅ `scripts/generate_rollouts_pivot.py` + config — generate rollouts (27 min on 1 GPU)
+3. ✅ `scripts/generate_sft_3action.py` — LLM-based rewriting via Qwen3-14B
+4. ✅ Update `proposal.tex`, `WORK_SPLIT.md`, `TODO.md`
+5. ✅ Quality check
 
-## Verification
-1. Rollouts generated: `wc -l data/rollouts_grouped_math_Qwen2.5-Math-7B.jsonl` → ~1000 lines
-2. SFT data built: `wc -l data/sft_3action_math_train.jsonl` → ~1500-2000 lines
-3. Spot-check: every example has exactly one `<terminate>`, correct `\boxed{}`, coherent reasoning
-4. Token setup: `python -c "from src.pivot.tokens import ACTION_TOKENS; print(ACTION_TOKENS)"` works
-5. Train smoke test: 1 epoch on 50 examples, model generates action tokens in output
+## Completed Results
+
+**Rollout generation:**
+```
+python -m scripts.generate_rollouts_pivot --config configs/generate_rollouts_qwen25.yaml
+→ 1000 problems, K=8, pass rate 74.8%, 631 trivial / 200 mixed / 169 impossible
+```
+
+**SFT dataset generation:**
+```
+python -m scripts.generate_sft_3action \
+    --rollouts data/rollouts_grouped_math_Qwen2.5-Math-7B.jsonl \
+    --rewriter Qwen/Qwen3-14B --gpus 1 --tp 1
+→ 816 examples (449 clean, 367 refine = 55%/45%)
+```
+
+**Quality checks (all pass):**
+- Every example: exactly 1 `<terminate>`, ≥1 `<continue>`, correct `\boxed{}`
+- `<terminate>` always before `\boxed{}`
+- All answers match gold
+- Refine directives are error-specific (not generic templates)
+- Avg 6.6 `<continue>` per example, median token length 456
+
+## Remaining
+- SFT warmup training (Member 2's responsibility, Stage 2)

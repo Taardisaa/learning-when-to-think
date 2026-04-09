@@ -1,0 +1,14 @@
+model: Qwen/Qwen2.5-Math-7B-Instruct
+subset: 1000    # number of MATH train problems
+num_samples: 8  # K rollouts per problem
+max_tokens: 2048
+temperature: 0.6
+top_p: 0.95
+
+# Infrastructure
+tp: 1
+gpu_mem: 0.90
+max_model_len: 4096
+
+seed: 42
+output: data/rollouts_grouped_math_Qwen2.5-Math-7B.jsonl
