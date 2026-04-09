@@ -1,0 +1,17 @@
+model: Qwen/Qwen2.5-Math-7B-Instruct
+checkpoint: null  # LoRA checkpoint path, or null for base model
+
+# Generation
+temperature: 0.0
+max_tokens: 2048
+top_p: 0.95
+top_k: -1  # -1 = disabled
+
+# Infrastructure
+tp: 1
+gpu_mem: 0.90
+max_model_len: 4096
+
+# Evaluation
+n: 500  # number of MATH-500 problems to evaluate
+output: null  # output JSON path, or null for auto-generated

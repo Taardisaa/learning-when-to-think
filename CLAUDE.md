@@ -1,3 +1,58 @@
+# Project: Learning When to Think
+
+LLMs waste compute by thinking the same amount on every problem. This project trains a model that learns *when to keep thinking, self-correct, or stop* via RL.
+
+## Core Approach
+
+We model reasoning as an MDP with three actions:
+- **`continue`**: Extend the current reasoning trajectory.
+- **`refine`**: Re-check and fix recent reasoning before continuing (lightweight self-correction).
+- **`terminate`**: Stop reasoning and output the final answer.
+
+**Base model**: Qwen2.5-Math-7B-Instruct with LoRA (r=16, α=32) on attention + MLP projections.
+
+**Reward**: Adaptive Length Penalty (ALP) — correctness reward minus a length penalty scaled by group solve rate SR(q). Easy problems (high SR) get penalized more for long solutions; hard problems (low SR) get slack.
+
+```
+R_k = r_acc,k − β · max(0, SR(q)) · n_tokens,k / L_max
+```
+
+**Training**: GRPO (Group Relative Policy Optimization) with DeGRPO weighting — control tokens (action decisions) get higher gradient weight than response tokens to prevent control-signal washout.
+
+```
+L = −A_k (w_ctrl · log p_ctrl + w_resp · log p_resp) + λ_KL · KL
+```
+with w_ctrl > w_resp (default: 2.0 vs 1.0).
+
+**Evaluation domain**: MATH-500 with `\boxed{}` and `####` answer extraction.
+
+**Baselines**: CoT single-pass, direct-answer (no reasoning), vanilla GRPO (degrpo=false).
+
+**Key metrics**: accuracy, avg tokens/problem, cost per correct answer, action usage by difficulty.
+
+**Ablation switches**: `allow_refine` (disables refine action), `degrpo` (toggles DeGRPO weighting).
+
+## Hypotheses
+
+- **H1**: ALP + DeGRPO improves accuracy–efficiency Pareto frontier over baselines.
+- **H2**: Learned policy allocates more tokens/steps to harder prompts.
+- **H3**: Action usage shifts with difficulty (more terminate on easy, more continue/refine on hard).
+
+## Work Split
+
+- **Member 1 (Data/Reward)**: MATH-500 loading, answer extraction & grading, evaluation harness, ALP reward function.
+- **Member 2 (RL Training)**: LoRA setup, 3-action policy with control tokens, GRPO update, DeGRPO gradient weighting.
+- **Member 3 (Generation/Experiments)**: Rollout sampling loop, baseline implementations, experiment execution, results & plots.
+
+## Timeline
+
+- Apr 7–11: Parallel development (data pipeline, RL core, generation infra)
+- Apr 12–14: Integration
+- Apr 15–18: Experiments and ablations
+- Apr 19–20: Presentation prep (present Apr 20)
+
+---
+
 # Dataset Generation Rules
 
 SFT data is built from Qwen3-1.7B's rollouts on MATH train. The core objective is injecting `<backoff_N>` tokens into CoT trajectories so the model learns to recognize errors mid-reasoning, emit backoff token(s), and self-correct toward the right answer. Every trajectory ends with the correct answer.

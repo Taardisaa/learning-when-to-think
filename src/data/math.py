@@ -39,6 +39,7 @@ def normalize_math_answer(answer: str) -> str:
     s = re.sub(r"\\text(?:bf|it|rm|sf)?\{([^}]*)\}", r"\1", s)
     s = re.sub(r"\\mathrm\{([^}]*)\}", r"\1", s)
     s = re.sub(r"\\mathbf\{([^}]*)\}", r"\1", s)
+    s = s.replace("\\dfrac", "\\frac")
     s = s.replace("\\left", "").replace("\\right", "")
     s = s.replace("\\$", "").replace("$", "")
     s = s.replace("\\!", "")
