@@ -2,12 +2,16 @@
 model: checkpoints/sft_pivot/merged
 output_dir: checkpoints/grpo_pivot/final
 
-# Training data (MATH train problems)
-data_subset: 200   # number of MATH train problems to train on (per epoch)
+# Training data
+# Option A: random sample from MATH train (rollouts_file: null)
+# Option B: filter pre-generated rollouts by pass_rate (recommended for GRPO signal)
+rollouts_file: data/rollouts_grouped_math_Qwen2.5-Math-7B.jsonl
+pass_rate_range: [0.125, 0.875]   # only train on problems where SFT model is uncertain
+data_subset: 200   # number of problems to use (after filtering)
 
 # Generation
 num_generations: 4
-max_completion_length: 1024
+max_completion_length: 2048
 temperature: 0.6
 top_p: 0.95
 
@@ -31,13 +35,14 @@ alp_l_max: 2048
 
 # Training loop
 num_train_epochs: 1
-learning_rate: 1.0e-5
+learning_rate: 2.0e-6
 per_device_train_batch_size: 1    # number of PROMPTS per device (expanded to K rollouts)
 gradient_accumulation_steps: 4
 max_steps: -1                     # -1 = use num_train_epochs
 bf16: true
 logging_steps: 1
 save_strategy: steps
-save_steps: 50
+save_steps: 2
+save_total_limit: 5
 seed: 42
 gpus: null

@@ -49,9 +49,11 @@ DEFAULTS = {
     "bf16": True,
     "logging_steps": 1,
     "save_strategy": "steps",
-    "save_steps": 50,
+    "save_steps": 2,
+    "save_total_limit": 5,
     "seed": 42,
     "gpus": None,
+    "resume_from_checkpoint": None,
 }
 
 
@@ -80,6 +82,8 @@ def main():
     parser.add_argument("--num-train-epochs", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--logging-steps", type=int, default=None)
+    parser.add_argument("--resume-from", default=None,
+                        help="Checkpoint dir to resume training from")
     parser.add_argument("--gpus", default=None)
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
@@ -99,6 +103,7 @@ def main():
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "num_train_epochs": args.num_train_epochs, "max_steps": args.max_steps,
         "logging_steps": args.logging_steps, "gpus": args.gpus, "seed": args.seed,
+        "resume_from_checkpoint": args.resume_from,
     }
     for k, v in cli_overrides.items():
         if v is not None:
@@ -130,22 +135,54 @@ def main():
     print(f"LR:             {cfg['learning_rate']}")
 
     # Build training dataset
-    print(f"\nLoading MATH train ({cfg['data_subset']} problems)...")
-    problems = load_math_train(subset_size=cfg["data_subset"], seed=cfg["seed"])
-
-    def make_record(p):
-        user_msg = f"{SYSTEM_PROMPT}\n\n{p['question']}"
+    def make_record(question, answer):
+        user_msg = f"{SYSTEM_PROMPT}\n\n{question}"
         return {
             "prompt": [{"role": "user", "content": user_msg}],
-            "gold_answer": p["answer"],
+            "gold_answer": answer,
         }
 
-    dataset = Dataset.from_list([make_record(p) for p in problems])
+    # Option: filter by pass rate from pre-generated rollouts to focus on mid-difficulty
+    rollouts_file = cfg.get("rollouts_file")
+    pass_rate_range = cfg.get("pass_rate_range", [0.0, 1.0])
+    if rollouts_file:
+        import json
+        print(f"\nLoading rollouts from {rollouts_file}...")
+        with open(rollouts_file) as f:
+            groups = [json.loads(line) for line in f]
+        lo, hi = pass_rate_range
+        filtered = [g for g in groups if lo <= g["pass_rate"] <= hi]
+        print(f"  Filtered {len(filtered)}/{len(groups)} problems with {lo} <= pass_rate <= {hi}")
+        # Optionally subset
+        if cfg["data_subset"] and cfg["data_subset"] < len(filtered):
+            import random
+            random.Random(cfg["seed"]).shuffle(filtered)
+            filtered = filtered[: cfg["data_subset"]]
+        records = [make_record(g["question"], g["answer"]) for g in filtered]
+    else:
+        print(f"\nLoading MATH train ({cfg['data_subset']} problems)...")
+        problems = load_math_train(subset_size=cfg["data_subset"], seed=cfg["seed"])
+        records = [make_record(p["question"], p["answer"]) for p in problems]
+
+    dataset = Dataset.from_list(records)
     print(f"Dataset size: {len(dataset)}")
 
     # Strategy
     strategy = get_strategy(cfg["action_strategy"])
     print(f"Strategy:       {strategy.name}")
+
+    # Safety: if strategy needs action tokens, verify the model/tokenizer has them
+    if cfg["action_strategy"] != "no_injection":
+        from transformers import AutoTokenizer
+        from src.pivot.tokens import ACTION_TOKENS
+        _tok = AutoTokenizer.from_pretrained(cfg["model"])
+        missing = [t for t in ACTION_TOKENS if _tok.convert_tokens_to_ids(t) == _tok.unk_token_id or _tok.convert_tokens_to_ids(t) is None]
+        if missing:
+            raise ValueError(
+                f"Strategy '{cfg['action_strategy']}' requires action tokens in vocab, "
+                f"but model '{cfg['model']}' is missing: {missing}. "
+                f"Use action_strategy=no_injection for base models without SFT warmup."
+            )
 
     # Reward and rollout
     reward_func = make_alp_reward_func(
@@ -175,7 +212,8 @@ def main():
         save_strategy=cfg["save_strategy"],
         save_steps=cfg["save_steps"],
         seed=cfg["seed"],
-        report_to="none",
+        report_to="tensorboard",
+        logging_dir=f"{cfg['output_dir']}/tb",
         remove_unused_columns=False,
         use_vllm=False,  # HF generate; vLLM has version mismatch
     )
@@ -192,6 +230,39 @@ def main():
         task_type="CAUSAL_LM",
     )
 
+    # Circuit breaker: abort training if clipped_ratio indicates model collapse
+    from transformers import TrainerCallback
+
+    class ClippedRatioCircuitBreaker(TrainerCallback):
+        """Stops training if completions/clipped_ratio reaches threshold for N steps.
+
+        This indicates the model stopped terminating completions (usually means
+        it collapsed into non-stopping generation). Better to bail early so the
+        latest good checkpoint is preserved.
+        """
+
+        def __init__(self, threshold: float = 0.99, patience: int = 1):
+            self.threshold = threshold
+            self.patience = patience
+            self.bad_streak = 0
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not logs:
+                return
+            cr = logs.get("completions/clipped_ratio")
+            if cr is None:
+                return
+            if cr >= self.threshold:
+                self.bad_streak += 1
+                print(f"[CircuitBreaker] clipped_ratio={cr:.2f} >= {self.threshold} "
+                      f"(streak {self.bad_streak}/{self.patience})")
+                if self.bad_streak >= self.patience:
+                    print("[CircuitBreaker] Triggered — stopping training. "
+                          "Resume from last healthy checkpoint.")
+                    control.should_training_stop = True
+            else:
+                self.bad_streak = 0
+
     print("\nInitializing GRPOTrainer...")
     trainer = GRPOTrainer(
         model=cfg["model"],
@@ -200,11 +271,16 @@ def main():
         train_dataset=dataset,
         rollout_func=rollout_func,
         peft_config=peft_config,
+        callbacks=[ClippedRatioCircuitBreaker(threshold=0.99, patience=1)],
     )
+
+    resume = cfg.get("resume_from_checkpoint")
+    if resume:
+        print(f"\nResuming from checkpoint: {resume}")
 
     print(f"\nStarting training...")
     t0 = time.time()
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume)
     elapsed = time.time() - t0
     print(f"\nTraining complete in {elapsed:.1f}s ({elapsed/60:.1f}m)")
 

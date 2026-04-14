@@ -244,7 +244,8 @@ def main():
         warmup_ratio=cfg["warmup_ratio"],
         lr_scheduler_type=cfg["lr_scheduler"],
         seed=cfg["seed"],
-        report_to="none",
+        report_to="tensorboard",
+        logging_dir=f"{cfg['output_dir']}/tb",
         remove_unused_columns=False,
     )
 

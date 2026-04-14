@@ -1,0 +1,28 @@
+# Remove old broken checkpoint
+# rm -rf checkpoints/sft_pivot/
+
+# Retrain with fixed init
+python -m scripts.train_sft_pivot --config configs/sft_3action.yaml --gpus 1
+
+# Merge
+python -m scripts.merge_sft_adapter \
+    --adapter checkpoints/sft_pivot/final \
+    --output checkpoints/sft_pivot/merged \
+    --gpus 1
+
+# Eval
+python -m scripts.eval_pivot \
+    --model checkpoints/sft_pivot/merged \
+    --n 10
+
+# DAPO+ALP
+PYTHONPATH=. CUDA_VISIBLE_DEVICES=0,1 venv/bin/accelerate launch --num_processes 2 scripts/train_grpo_pivot.py --config configs/grpo_3action.yaml --max-steps 30 --num-generations 4 --gradient-accumulation-steps 2
+
+# No Hard Mask
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. venv/bin/python -m scripts.eval_pivot --model checkpoints/sft_pivot/merged --checkpoint checkpoints/grpo_pivot/final/checkpoint-30 --n 100 --action-strategy no_injection --output eval_results/grpo30_no_injection_n100.json --temperature 0.6
+
+# Hard Mask
+PYTHONPATH=. venv/bin/python -m scripts.eval_pivot_hf --model checkpoints/sft_pivot/merged --checkpoint   checkpoints/grpo_pivot/final/checkpoint-30 --n 100 --action-strategy hard_mask --gpus 1 --output eval_results/grpo30_hard_mask_n100.json
+
+# Keep training for full 300 steps
+ROLLOUT_DUMP_EVERY=2 PYTHONPATH=. CUDA_VISIBLE_DEVICES=0,1 venv/bin/accelerate launch --num_processes 2   scripts/train_grpo_pivot.py --config configs/grpo_3action.yaml --max-steps 300 --num-generations 4 --gradient-accumulation-steps 2 --resume-from checkpoints/grpo_pivot/final/checkpoint-30 2>&1 | tee train_overnight.log

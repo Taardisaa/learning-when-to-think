@@ -1,0 +1,53 @@
+# DAPO baseline: same hyperparameters as ours, but:
+# - Starts from Qwen2.5-Math-7B-Instruct (base, not SFT warmup)
+# - No action-token injection (no_injection strategy)
+# - Action tokens will not appear in outputs (vocab doesn't have them)
+#
+# This isolates the contribution of SFT warmup + action tokens + hard mask
+# from the DAPO optimization itself.
+
+model: Qwen/Qwen2.5-Math-7B-Instruct
+output_dir: checkpoints/grpo_baseline/final
+
+# Training data (same as ours for fair comparison)
+rollouts_file: data/rollouts_grouped_math_Qwen2.5-Math-7B.jsonl
+pass_rate_range: [0.125, 0.875]
+data_subset: 200
+
+# Generation
+num_generations: 4
+max_completion_length: 2048
+temperature: 0.6
+top_p: 0.95
+
+# CRITICAL: baseline has no action-token machinery
+action_strategy: no_injection
+
+# GRPO / DAPO (same as ours)
+beta: 0.01
+epsilon: 0.2
+loss_type: dapo
+
+# ALP reward (same)
+alp_beta: 0.05
+alp_l_max: 2048
+
+# LoRA (same — but applied on raw base model, not SFT checkpoint)
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# Training (same)
+num_train_epochs: 1
+learning_rate: 2.0e-6
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4
+max_steps: -1
+bf16: true
+logging_steps: 1
+save_strategy: steps
+save_steps: 2
+save_total_limit: 5
+seed: 42
+gpus: null

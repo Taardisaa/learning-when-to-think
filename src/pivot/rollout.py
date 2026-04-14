@@ -8,6 +8,7 @@ log-probs expected by trl.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -59,19 +60,30 @@ def make_rollout_func(strategy: ActionStrategy) -> Any:
             add_special_tokens=False,
         ).to(device)
 
-        num_gen = trainer.num_generations
+        # NOTE: trl's RepeatSampler already duplicates each prompt num_generations times
+        # before calling us, so we produce 1 completion per input (not num_generations).
         gen_kwargs = dict(trainer.generation_kwargs)
         # Strip kwargs that aren't compatible with generate()
         for k in ("cache_implementation",):
             gen_kwargs.pop(k, None)
-        gen_kwargs["num_return_sequences"] = num_gen
+        gen_kwargs["num_return_sequences"] = 1
         if logits_processor is not None:
             gen_kwargs["logits_processor"] = [logits_processor]
         gen_kwargs["return_dict_in_generate"] = True
         gen_kwargs["output_scores"] = True
 
-        with torch.no_grad():
-            out = model.generate(
+        # Critical: use trl's unwrap_model_for_generation so the model is in eval
+        # mode during generation (no dropout), DDP/FSDP is unwrapped, and
+        # use_cache is re-enabled. Without this, generation produces garbage.
+        from trl.models import unwrap_model_for_generation
+
+        with unwrap_model_for_generation(
+            model,
+            trainer.accelerator,
+            gather_deepspeed3_params=getattr(trainer.args, "ds3_gather_for_generation", True),
+            generation_kwargs=gen_kwargs,
+        ) as unwrapped_model, torch.no_grad():
+            out = unwrapped_model.generate(
                 input_ids=encoding.input_ids,
                 attention_mask=encoding.attention_mask,
                 **gen_kwargs,
@@ -80,6 +92,38 @@ def make_rollout_func(strategy: ActionStrategy) -> Any:
         sequences = out.sequences  # (batch*num_gen, prompt_len + comp_len)
         prompt_len = encoding.input_ids.shape[1]
         completion_ids_batched = sequences[:, prompt_len:]
+
+        # Dump rollouts to disk every N steps for inspection.
+        # Default: every step for first 5, then every 5. Override via ROLLOUT_DUMP_EVERY env.
+        step = getattr(trainer.state, "global_step", 0)
+        dump_every = int(os.environ.get("ROLLOUT_DUMP_EVERY", "1" if step < 5 else "5"))
+        if dump_every > 0 and step % dump_every == 0:
+            import json as _json
+            from pathlib import Path as _Path
+            comp_lens = [int((completion_ids_batched[i] != tokenizer.pad_token_id).sum())
+                         for i in range(sequences.shape[0])]
+            summary = []
+            for i in range(sequences.shape[0]):
+                ids = completion_ids_batched[i].tolist()
+                text = tokenizer.decode(ids, skip_special_tokens=False)
+                prompt_text = tokenizer.decode(encoding.input_ids[i].tolist(), skip_special_tokens=False)
+                summary.append({
+                    "index": i,
+                    "prompt_text": prompt_text,
+                    "completion_text": text,
+                    "completion_length": comp_lens[i],
+                    "action_counts": {
+                        tok: sum(1 for t in ids if t == tokenizer.convert_tokens_to_ids(tok))
+                        for tok in ACTION_TOKENS
+                    },
+                    "has_eos": tokenizer.eos_token_id in ids,
+                    "token_ids": ids,
+                })
+            dump_dir = _Path("debug_rollouts")
+            dump_dir.mkdir(exist_ok=True)
+            dump_path = dump_dir / f"step_{step:06d}.json"
+            with open(dump_path, "w") as _f:
+                _json.dump(summary, _f, indent=2, ensure_ascii=False)
 
         # Stack scores: tuple of (batch*num_gen, vocab_size), length comp_len
         scores = torch.stack(out.scores, dim=1)  # (B, comp_len, vocab)
@@ -100,13 +144,10 @@ def make_rollout_func(strategy: ActionStrategy) -> Any:
         completion_ids_list = []
         logprobs_list = []
 
-        # Expand prompt ids to one per rollout
-        # encoding.input_ids has shape (num_prompts, prompt_len) — we need num_prompts * num_gen rows.
-        expanded_prompts = encoding.input_ids.repeat_interleave(num_gen, dim=0)
-
+        # With num_return_sequences=1, rows map 1:1 to input prompts
         for i in range(sequences.shape[0]):
             # Strip left-padding from the prompt
-            raw_prompt = expanded_prompts[i].tolist()
+            raw_prompt = encoding.input_ids[i].tolist()
             pad_id = tokenizer.pad_token_id or 0
             # Find first non-pad position
             j = 0

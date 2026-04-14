@@ -63,23 +63,33 @@ def _boundary_mask(last_tokens: torch.Tensor, boundary_ids: set[int]) -> torch.T
 
 
 class _HardMaskProcessor(LogitsProcessor):
-    """Masks all non-action logits at positions following a step-boundary token."""
+    """Masks all non-action logits at step boundaries, until <terminate> is emitted.
 
-    def __init__(self, action_token_ids: list[int], boundary_ids: set[int]):
+    After the model emits <terminate>, masking is disabled for that sequence so
+    it can freely generate \\boxed{answer} and <|im_end|>.
+    """
+
+    def __init__(self, action_token_ids: list[int], boundary_ids: set[int], terminate_id: int):
         self.action_ids = torch.tensor(action_token_ids, dtype=torch.long)
         self.boundary_ids = boundary_ids
+        self.terminate_id = terminate_id
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         if input_ids.shape[1] == 0:
             return scores
 
+        # Disable masking for any sequence that has already emitted <terminate>
+        already_terminated = (input_ids == self.terminate_id).any(dim=1)
+
         last_token = input_ids[:, -1]
-        mask_rows = _boundary_mask(last_token, self.boundary_ids)
+        at_boundary = _boundary_mask(last_token, self.boundary_ids)
+
+        # Apply mask only to rows that are at a boundary AND haven't terminated yet
+        mask_rows = at_boundary & ~already_terminated
         if not mask_rows.any():
             return scores
 
         action_ids = self.action_ids.to(scores.device)
-        # Build vocab allow-mask: True for action tokens
         vocab_allow = torch.zeros(scores.shape[-1], dtype=torch.bool, device=scores.device)
         vocab_allow[action_ids] = True
 
@@ -94,7 +104,11 @@ class _HardMaskProcessor(LogitsProcessor):
 
 
 class HardMask:
-    """After a step-boundary token (e.g. `.\\n\\n`), force the next token to be an action."""
+    """After a step-boundary token, force the next token to be an action.
+
+    Masking stops once <terminate> is emitted, so the model can freely write
+    \\boxed{answer} and end the sequence.
+    """
 
     name = "hard_mask"
 
@@ -102,7 +116,9 @@ class HardMask:
         self.boundary_ids = boundary_ids or STEP_BOUNDARY_TOKEN_IDS
 
     def logits_processor(self, action_token_ids: list[int]) -> LogitsProcessor:
-        return _HardMaskProcessor(action_token_ids, self.boundary_ids)
+        # Assume the third action token is <terminate> (matches src/pivot/tokens.py ordering)
+        terminate_id = action_token_ids[-1]
+        return _HardMaskProcessor(action_token_ids, self.boundary_ids, terminate_id)
 
 
 class _SoftBiasProcessor(LogitsProcessor):

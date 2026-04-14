@@ -51,6 +51,9 @@ def make_alp_reward_func(
                 texts.append(str(c))
 
         n = len(texts)
+        assert len(gold_answer) == n, (
+            f"gold_answer length {len(gold_answer)} != completions {n}"
+        )
         # completion_ids is a list of lists of token ids
         if completion_ids is None:
             # Fallback: approximate token count from text length

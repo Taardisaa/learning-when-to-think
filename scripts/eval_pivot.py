@@ -81,6 +81,9 @@ def main():
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--output", default=None)
+    parser.add_argument("--action-strategy", default="no_injection",
+                        choices=["no_injection", "hard_mask", "soft_bias"],
+                        help="Logits processor to apply during generation")
     args = parser.parse_args()
 
     # Build config: defaults <- yaml <- cli overrides
@@ -142,6 +145,7 @@ def main():
         sampling_kwargs["top_p"] = cfg["top_p"]
         if cfg["top_k"] > 0:
             sampling_kwargs["top_k"] = cfg["top_k"]
+
     params = SamplingParams(**sampling_kwargs)
 
     # Generate
@@ -154,12 +158,25 @@ def main():
     elapsed = time.time() - t0
     print(f"Done in {elapsed:.1f}s ({elapsed / len(problems):.2f}s/problem)")
 
+    # Map action-token IDs -> short name (action_id -> "continue"/"refine"/"terminate")
+    action_id_to_name = {}
+    for tok in ["<continue>", "<refine>", "<terminate>"]:
+        tid = tokenizer.convert_tokens_to_ids(tok)
+        if tid is not None and tid != tokenizer.unk_token_id:
+            action_id_to_name[tid] = tok.strip("<>")
+
     # Build RolloutResults
     results = []
     for p, o in zip(problems, outputs):
-        text = o.outputs[0].text
+        # Decode with skip_special_tokens=False so action tokens show up in text too
+        token_ids = list(o.outputs[0].token_ids)
+        text = tokenizer.decode(token_ids, skip_special_tokens=False)
         predicted = extract_boxed_answer(text)
         is_correct = grade_math_answer(predicted, p["answer"])
+
+        # Extract action sequence from token IDs
+        actions = [action_id_to_name[tid] for tid in token_ids if tid in action_id_to_name]
+
         results.append(RolloutResult(
             prompt_id=p["unique_id"],
             question=p["question"],
@@ -169,8 +186,8 @@ def main():
             generated_text=text,
             predicted_answer=predicted,
             correct=is_correct,
-            num_tokens=len(o.outputs[0].token_ids),
-            actions=[],  # baseline: no actions
+            num_tokens=len(token_ids),
+            actions=actions,
         ))
 
     # Evaluate and report
