@@ -1,0 +1,43 @@
+# Model
+model: checkpoints/sft_pivot/merged
+output_dir: checkpoints/grpo_pivot/final
+
+# Training data (MATH train problems)
+data_subset: 200   # number of MATH train problems to train on (per epoch)
+
+# Generation
+num_generations: 4
+max_completion_length: 1024
+temperature: 0.6
+top_p: 0.95
+
+# Action-injection strategy: no_injection | hard_mask | soft_bias
+action_strategy: hard_mask
+
+# LoRA (applied on top of merged SFT model)
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# GRPO
+beta: 0.01            # KL coefficient (0 = no ref model, 0.01 = light KL)
+epsilon: 0.2          # clipping threshold
+loss_type: dapo
+
+# ALP reward
+alp_beta: 0.05
+alp_l_max: 2048
+
+# Training loop
+num_train_epochs: 1
+learning_rate: 1.0e-5
+per_device_train_batch_size: 1    # number of PROMPTS per device (expanded to K rollouts)
+gradient_accumulation_steps: 4
+max_steps: -1                     # -1 = use num_train_epochs
+bf16: true
+logging_steps: 1
+save_strategy: steps
+save_steps: 50
+seed: 42
+gpus: null

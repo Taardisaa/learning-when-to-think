@@ -1,0 +1,37 @@
+model: Qwen/Qwen2.5-Math-7B-Instruct
+data: data/sft_3action_math_train.jsonl
+output_dir: checkpoints/sft_pivot/final
+
+# Training
+epochs: 3
+lr: 2.0e-5
+batch_size: 1
+grad_accum: 8          # effective batch = 8
+max_seq_len: 2048
+warmup_ratio: 0.03
+lr_scheduler: cosine
+
+# LoRA
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_targets:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+# Infrastructure
+bf16: true
+logging_steps: 10
+save_strategy: epoch
+save_total_limit: 2
+seed: 42
+gpus: null  # e.g. "0" or "0,1"
+
+# Sanity check after training
+sanity_check_n: 3
+sanity_check_max_tokens: 1024

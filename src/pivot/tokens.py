@@ -34,15 +34,19 @@ def setup_tokenizer_and_model(
         "Tokens may already exist in the vocabulary."
     )
 
-    # Resize model embeddings
-    old_num_embeddings = model.get_input_embeddings().weight.shape[0]
+    # Resize model embeddings. Some models (e.g. Qwen2.5-Math) have more
+    # embedding rows than actual vocab (reserved/unused slots), so this may
+    # shrink or grow the matrix. New-token rows are the LAST `num_added`
+    # rows of the resized matrix regardless of direction.
     model.resize_token_embeddings(len(tokenizer))
+    new_vocab_size = len(tokenizer)
+    new_token_start = new_vocab_size - num_added  # first new-token row
 
-    # Initialize new embeddings: mean of existing + small noise
+    # Initialize new-token rows with mean of existing (non-new) rows + small noise
     with torch.no_grad():
         input_emb = model.get_input_embeddings().weight
-        mean_emb = input_emb[:old_num_embeddings].mean(dim=0)
-        for i in range(old_num_embeddings, len(tokenizer)):
+        mean_emb = input_emb[:new_token_start].mean(dim=0)
+        for i in range(new_token_start, new_vocab_size):
             noise = torch.randn_like(mean_emb) * 0.01
             input_emb[i] = mean_emb + noise
 
@@ -50,8 +54,8 @@ def setup_tokenizer_and_model(
         output_emb = model.get_output_embeddings()
         if output_emb is not None and output_emb.weight is not input_emb:
             out_w = output_emb.weight
-            mean_out = out_w[:old_num_embeddings].mean(dim=0)
-            for i in range(old_num_embeddings, len(tokenizer)):
+            mean_out = out_w[:new_token_start].mean(dim=0)
+            for i in range(new_token_start, new_vocab_size):
                 noise = torch.randn_like(mean_out) * 0.01
                 out_w[i] = mean_out + noise
 
